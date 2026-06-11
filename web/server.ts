@@ -199,6 +199,10 @@ async function handleJobAction(req: Request, id: string, action: string): Promis
 		jobs.enqueue(id)
 	}
 	if (action === 'stop') jobs.stop(id)
+	if (action === 'delete') {
+		// Only jobs that are neither running nor finished can be deleted.
+		if (jobs.delete(id)) return redirect('/')
+	}
 	if (action === 'settings') {
 		// The advanced form posts a dollar limit and a speed; empty clears each
 		// back to the default, junk leaves it unchanged.
@@ -220,6 +224,9 @@ async function handleJobAction(req: Request, id: string, action: string): Promis
 					jobs.update(id, { concurrency: Math.min(300, Math.max(10, speed)) })
 				}
 			}
+			// Settings saved against a live run apply immediately: the run is
+			// relaunched and the engine resumes from its database, losing nothing.
+			if (job.status === 'running') jobs.restart(id)
 		} catch {
 			// No form body; nothing to change.
 		}

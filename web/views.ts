@@ -26,9 +26,19 @@ function layout(title: string, body: string): string {
 	<link rel="stylesheet" href="/static/styles.css">
 	<script src="/static/htmx.min.js" defer></script>
 	<script>
-		// The job status is re-rendered on every poll, which would snap the
-		// disclosures shut; carry each one's open state across swaps.
-		document.addEventListener('htmx:beforeSwap', function () {
+		// The job status re-renders on every poll. Two protections: never swap
+		// while the user is editing a form inside it (a swap would wipe their
+		// typing), and carry each disclosure's open state across swaps.
+		document.addEventListener('htmx:beforeSwap', function (evt) {
+			var editing = document.querySelector('#status :focus') !== null ||
+				Array.prototype.some.call(
+					document.querySelectorAll('#status input'),
+					function (el) { return el.value !== el.defaultValue },
+				)
+			if (editing) {
+				evt.detail.shouldSwap = false
+				return
+			}
 			window.__open = Array.prototype.map.call(
 				document.querySelectorAll('#status details'),
 				function (d) { return d.open },
@@ -191,9 +201,9 @@ function advancedForm(v: StatusView): string {
 			<button class="rounded border border-stone-300 px-3 py-1 font-medium text-stone-600 hover:bg-stone-50">Save</button>
 		</form>
 		<p class="mt-1">
-			Empty boxes mean no spending limit and the standard speed. Changes take effect the next
-			time the job starts or resumes; a paused job keeps everything it collected. Speeds far
-			above 160 mostly hit eBay's own limits rather than going faster.
+			Empty boxes mean no spending limit and the standard speed. Saving while the job is
+			running restarts it with the new settings within seconds; nothing it collected is lost.
+			Speeds far above 160 mostly hit eBay's own limits rather than going faster.
 		</p>
 	</details>`
 }
@@ -221,6 +231,12 @@ export function statusFragment(v: StatusView): string {
 	if (job.status === 'running') {
 		buttons.push(`<form method="post" action="/jobs/${e(job.id)}/stop">
 			<button class="rounded-lg border border-stone-300 px-5 py-2 font-medium text-stone-700 hover:bg-stone-50">Stop</button>
+		</form>`)
+	}
+	if (job.status !== 'running' && job.status !== 'done') {
+		buttons.push(`<form method="post" action="/jobs/${e(job.id)}/delete"
+			onsubmit="return confirm('Delete this job and everything it has collected so far?')">
+			<button class="rounded-lg border border-red-200 px-5 py-2 font-medium text-red-600 hover:bg-red-50">Delete</button>
 		</form>`)
 	}
 

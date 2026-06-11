@@ -56,6 +56,7 @@ function newJobId(): string {
 export class JobManager {
 	private children = new Map<string, Deno.ChildProcess>()
 	private userStopped = new Set<string>()
+	private pendingRestart = new Set<string>()
 	private shuttingDown = false
 
 	constructor(private config: JobsConfig) {}
@@ -177,6 +178,31 @@ export class JobManager {
 		return job
 	}
 
+	// Apply new settings to a running job: kill the run and let it re-queue
+	// itself. The engine resumes from its database, so nothing is redone.
+	restart(id: string) {
+		const job = this.get(id)
+		if (!job || job.status !== 'running') return
+		const child = this.children.get(id)
+		if (!child) return
+		this.pendingRestart.add(id)
+		try {
+			child.kill('SIGTERM')
+		} catch {
+			this.pendingRestart.delete(id)
+		}
+	}
+
+	// Remove a job folder entirely. Running jobs must be stopped first, and
+	// finished jobs are kept (their CSVs are the deliverable).
+	delete(id: string): boolean {
+		const job = this.get(id)
+		if (!job || job.status === 'running' || job.status === 'done') return false
+		Deno.removeSync(this.jobDir(id), { recursive: true })
+		this.tick()
+		return true
+	}
+
 	// How many queued jobs are ahead of this one (plus a running one, if any).
 	queueAhead(id: string): number {
 		const job = this.get(id)
@@ -236,12 +262,16 @@ export class JobManager {
 		this.starting = true
 		this.spawn(next)
 			.catch((err) => {
-				this.save({
-					...next,
-					status: 'failed',
-					statusReason: `The job could not start: ${(err as Error).message}`,
-					pid: null,
-				})
+				try {
+					this.save({
+						...next,
+						status: 'failed',
+						statusReason: `The job could not start: ${(err as Error).message}`,
+						pid: null,
+					})
+				} catch {
+					// The job folder was deleted mid-start; nothing left to record.
+				}
 			})
 			.finally(() => {
 				this.starting = false
@@ -369,12 +399,17 @@ export class JobManager {
 		if (this.shuttingDown) return // shutdown() already recorded the interruption
 		const job = this.get(id)
 		if (!job) return
+		const wasRestart = this.pendingRestart.delete(id)
 		const wasStopped = this.userStopped.delete(id)
 		const progress = this.progress(id)
 
 		let status: JobStatus
 		let reason: string | null = null
-		if (wasStopped) {
+		if (wasRestart) {
+			// A settings change on a live job: straight back into the queue so it
+			// relaunches with the new settings.
+			status = 'queued'
+		} else if (wasStopped) {
 			status = 'interrupted'
 			reason = 'You stopped this job.'
 		} else if (progress.budgetStop) {
