@@ -1,0 +1,4 @@
+/* Tailwind v4 input. The standalone CLI scans the project for class names
+   automatically (it respects .gitignore); web/views.ts is the only source of
+   markup. Build with: deno task css (locally) or the Docker css stage. */
+@import 'tailwindcss';

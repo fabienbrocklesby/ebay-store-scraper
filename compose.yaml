@@ -1,0 +1,23 @@
+# Local parity test for the Dokploy deployment:
+#   cp .env.example .env   (fill in APP_PASSWORD and ZYTE_API_KEY)
+#   docker compose up --build
+# Jobs and CSVs live in the named volume and survive container restarts.
+services:
+  app:
+    build: .
+    ports:
+      - '8000:8000'
+    environment:
+      APP_PASSWORD: ${APP_PASSWORD:?set APP_PASSWORD in .env (copy .env.example)}
+      ZYTE_API_KEY: ${ZYTE_API_KEY:?set ZYTE_API_KEY in .env (copy .env.example)}
+      MAX_REQUESTS_PER_JOB: ${MAX_REQUESTS_PER_JOB:-}
+      COST_PER_1K_USD: ${COST_PER_1K_USD:-0.12}
+      SCRAPE_CONCURRENCY: ${SCRAPE_CONCURRENCY:-160}
+      # Test-only engine flags, e.g. SCRAPE_EXTRA_ARGS=--cap=4 (see TESTING.md)
+      SCRAPE_EXTRA_ARGS: ${SCRAPE_EXTRA_ARGS:-}
+    volumes:
+      - jobs:/data
+    restart: unless-stopped
+
+volumes:
+  jobs:

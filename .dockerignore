@@ -1,0 +1,7 @@
+.git
+data
+jobs
+bin
+.vscode
+.DS_Store
+*.md
