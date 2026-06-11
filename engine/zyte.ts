@@ -35,8 +35,12 @@ export class BudgetExceeded extends Error {
 	}
 }
 
+export interface FetchOptions {
+	geolocation?: string // ISO country code; eBay then renders shipping for it
+}
+
 // Fetch one URL through Zyte and return its raw HTML.
-export async function fetchHTML(url: string, attempt = 1): Promise<string> {
+export async function fetchHTML(url: string, opts: FetchOptions = {}, attempt = 1): Promise<string> {
 	// Checked here rather than at module load so key-free commands (export,
 	// tests) keep working without one.
 	if (!API_KEY) {
@@ -53,7 +57,11 @@ export async function fetchHTML(url: string, attempt = 1): Promise<string> {
 			'Content-Type': 'application/json',
 			Authorization: 'Basic ' + btoa(API_KEY + ':'),
 		},
-		body: JSON.stringify({ url, httpResponseBody: true }),
+		body: JSON.stringify({
+			url,
+			httpResponseBody: true,
+			...(opts.geolocation ? { geolocation: opts.geolocation } : {}),
+		}),
 	})
 	const secs = ((performance.now() - t0) / 1000).toFixed(1)
 
@@ -80,12 +88,12 @@ export async function fetchHTML(url: string, attempt = 1): Promise<string> {
 				}s (try ${attempt}) ${url}`,
 			)
 		}
-		return fetchHTML(url, attempt + 1)
+		return fetchHTML(url, opts, attempt + 1)
 	}
 	if (TRANSIENT_STATUSES.includes(res.status) && attempt <= 4) {
 		if (verbose) console.log(`    zyte ${res.status} transient, retry ${attempt} in ${attempt * 3}s ${url}`)
 		await sleep(attempt * 3000)
-		return fetchHTML(url, attempt + 1)
+		return fetchHTML(url, opts, attempt + 1)
 	}
 
 	throw new Error(`Zyte returned ${res.status} ${errorType} for ${url}`)

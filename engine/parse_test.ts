@@ -1,7 +1,7 @@
 // Unit tests for the pure HTML parsers, against compact synthetic fixtures
 // that mirror eBay's real markup anchors.
 import { assertEquals } from '@std/assert'
-import { htmlToText, parseItemPage, parseSearchPage } from './parse.ts'
+import { htmlToText, parseItemPage, parseSearchPage, parseShipping } from './parse.ts'
 
 function card(id: string, title: string, price = '18.20', img = 'zKQAAOSwFnFWFVhC') {
 	return `<li class="s-card s-card--horizontal" data-listingid=${id}>
@@ -103,4 +103,59 @@ Deno.test('parseItemPage falls back to the h1 when the <title> tag is empty', ()
 Deno.test('htmlToText strips tags, scripts, and entities', () => {
 	const text = htmlToText('<div><script>junk()</script><p>A &amp; B&nbsp;&quot;C&quot;</p>  <b>D</b></div>')
 	assertEquals(text, 'A & B "C" D')
+})
+
+// --- shipping ---
+
+const SHIPPING_BLOCK = `
+<div class="ux-labels-values columns ux-labels-values--shipping">
+	<dt><span class="ux-textspans">Shipping:</span></dt>
+	<dd><span class="ux-textspans ux-textspans--BOLD">US $18.16</span>
+	<span class="ux-textspans ux-textspans--SECONDARY">(approx NZD31.33)</span>&nbsp;
+	<span class="ux-textspans">eBay International Shipping</span></dd>
+</div>
+<div class="ux-labels-values ux-labels-values--deliverto">
+	<dt><span class="ux-textspans">Delivery:</span></dt>
+	<dd><span class="ux-textspans">Estimated between</span> <span class="ux-textspans--BOLD">Mon, Jun 29</span>
+	<span> and </span><span class="ux-textspans--BOLD">Wed, Jul 8</span><span> to </span><span>1023</span></dd>
+</div>`
+
+Deno.test('parseShipping reads cost, currency, and the delivery window', () => {
+	assertEquals(parseShipping(SHIPPING_BLOCK), {
+		ships_to: 'yes',
+		shipping_cost: '18.16',
+		shipping_currency: 'USD',
+		shipping_time: 'Mon, Jun 29 to Wed, Jul 8',
+	})
+})
+
+Deno.test('parseShipping handles free shipping', () => {
+	const html = `<div class="ux-labels-values--shipping"><dt>Shipping:</dt>
+		<dd><span class="ux-textspans">Free shipping</span></dd></div>`
+	const s = parseShipping(html)
+	assertEquals(s.ships_to, 'yes')
+	assertEquals(s.shipping_cost, '0.00')
+	assertEquals(s.shipping_currency, '')
+})
+
+Deno.test('parseShipping flags items that do not ship to the country', () => {
+	const html = `<div class="ux-labels-values--shipping"><dt>Shipping:</dt>
+		<dd><span class="ux-textspans">May not ship to New Zealand - Read item description</span></dd></div>`
+	assertEquals(parseShipping(html), {
+		ships_to: 'no',
+		shipping_cost: '',
+		shipping_currency: '',
+		shipping_time: '',
+	})
+})
+
+Deno.test('parseShipping reads other currencies and thousands separators', () => {
+	const html = `<div class="ux-labels-values--shipping"><dd><span>NZ $1,234.50</span></dd></div>`
+	const s = parseShipping(html)
+	assertEquals(s.shipping_cost, '1234.50')
+	assertEquals(s.shipping_currency, 'NZD')
+})
+
+Deno.test('parseShipping returns empty fields when the page has no shipping block', () => {
+	assertEquals(parseShipping('<html><body>nothing here</body></html>').ships_to, '')
 })

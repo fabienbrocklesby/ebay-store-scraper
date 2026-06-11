@@ -96,6 +96,67 @@ export function parseSearchPage(html: string): SearchCard[] {
 	return cards
 }
 
+// Shipping and delivery as eBay renders them for the viewer's country (the
+// page fetch is geolocated there). Empty fields mean eBay did not state them.
+//
+// Markup anchors: the shipping row is a "ux-labels-values--shipping" block
+// ("US $18.16 (approx NZD31.33) eBay International Shipping" or "Free
+// shipping" or "May not ship to New Zealand"); the delivery row is a
+// "ux-labels-values--deliverto" block ("Estimated between Mon, Jun 29 and
+// Wed, Jul 8 to 1023").
+export type ShippingInfo = {
+	ships_to: 'yes' | 'no' | ''
+	shipping_cost: string // amount only, '0.00' for free shipping
+	shipping_currency: string
+	shipping_time: string // e.g. 'Mon, Jun 29 to Wed, Jul 8'
+}
+
+const SHIP_MONEY = /(US\s?\$|NZ\s?\$|AU\s?\$|C\s?\$|£|€|GBP\s?|EUR\s?|\$)\s?([\d,]+(?:\.\d+)?)/
+const SHIP_CURRENCIES: [RegExp, string][] = [
+	[/^US/, 'USD'],
+	[/^NZ/, 'NZD'],
+	[/^AU/, 'AUD'],
+	[/^C/, 'CAD'],
+	[/^£/, 'GBP'],
+	[/^(€|EUR)/, 'EUR'],
+	[/^GBP/, 'GBP'],
+	[/^\$/, 'USD'],
+]
+
+function labeledRowText(html: string, marker: string): string {
+	const at = html.indexOf(marker)
+	return at < 0 ? '' : htmlToText(html.slice(at, at + 4000))
+}
+
+export function parseShipping(html: string): ShippingInfo {
+	const none: ShippingInfo = { ships_to: '', shipping_cost: '', shipping_currency: '', shipping_time: '' }
+	const shipping = labeledRowText(html, 'ux-labels-values--shipping')
+	const delivery = labeledRowText(html, 'ux-labels-values--deliverto')
+	if (!shipping && !delivery) return none
+
+	if (/(does not|may not|doesn'?t) ship to/i.test(`${shipping} ${delivery}`)) {
+		return { ...none, ships_to: 'no' }
+	}
+
+	let cost = ''
+	let currency = ''
+	const money = shipping.match(SHIP_MONEY)
+	if (money) {
+		cost = money[2].replaceAll(',', '')
+		currency = SHIP_CURRENCIES.find(([re]) => re.test(money[1]))?.[1] ?? ''
+	} else if (/\bfree\b/i.test(shipping)) {
+		cost = '0.00'
+	}
+
+	const between = delivery.match(
+		/Estimated between\s+([A-Z][a-z]{2}, [A-Z][a-z]{2} \d{1,2})\s+and\s+([A-Z][a-z]{2}, [A-Z][a-z]{2} \d{1,2})/,
+	)
+	const onOrBefore = delivery.match(/Estimated (?:delivery )?on or before\s+([A-Z][a-z]{2}, [A-Z][a-z]{2} \d{1,2})/)
+	const time = between ? `${between[1]} to ${between[2]}` : onOrBefore ? `by ${onOrBefore[1]}` : ''
+
+	return { ships_to: 'yes', shipping_cost: cost, shipping_currency: currency, shipping_time: time }
+}
+
 // Parse one "Item specifics" row (a <dl> block) into [label, value].
 function parseSpecificsRow(block: string): [string, string] | null {
 	const label = block.match(/ux-labels-values__labels[\s\S]{0,300}?<span[^>]*>([^<]+)<\/span>/)?.[1]

@@ -17,7 +17,8 @@
 
 import { DatabaseSync } from 'node:sqlite'
 import { BudgetExceeded, configure, fetchHTML, requestsMade } from './zyte.ts'
-import { htmlToText, parseItemPage, parseSearchPage, type SearchCard } from './parse.ts'
+import { htmlToText, parseItemPage, parseSearchPage, parseShipping, type SearchCard } from './parse.ts'
+import { convert, loadRates } from './fx.ts'
 
 // --- knobs ---
 const DEFAULT_CONCURRENCY = 30 // parallel Zyte requests. The account allows 3000
@@ -27,19 +28,29 @@ const DEFAULT_MAX_REQUESTS = 25000 // budget stop per run; see README.
 const SEGMENT_CAP = 9000 // eBay stops serving a search past ~10k results; a
 // price band that yields this many gets split in half and re-walked.
 const MAX_PAGES_PER_SEGMENT = 45
+const LISTING_WAVE = 5 // search pages fetched concurrently while walking one store
 const ROWS_PER_CSV = 50000
 const DB_PATH = './data/scrape.db'
 
 // --- CLI flags ---
-// --desc | --full | --cap=N | --concurrency=N | --max-requests=N | --verbose
+// --desc | --full | --no-desc | --cap=N | --concurrency=N | --max-requests=N
+// --ship-to=NZ | --convert-to=NZD | --fx=data/fx.json | --verbose
 const flag = (name: string) => Deno.args.includes(`--${name}`)
 const flagValue = (name: string) => {
 	const arg = Deno.args.find((a) => a.startsWith(`--${name}=`))
 	return arg ? Number(arg.split('=')[1]) : null
 }
+const flagText = (name: string) => {
+	const arg = Deno.args.find((a) => a.startsWith(`--${name}=`))
+	return arg ? arg.split('=')[1] : null
+}
 const verbose = flag('verbose') || flag('v')
 const wantDesc = flag('desc')
 const wantFull = flag('full')
+const skipDesc = flag('no-desc') // with --full: item page only, 1 request/product
+const shipTo = flagText('ship-to') // 2-letter country: geolocate item pages there
+const convertTo = flagText('convert-to') // ISO currency for the CSV export
+const fxPath = flagText('fx') ?? './data/fx.json'
 const concurrency = flagValue('concurrency') ?? DEFAULT_CONCURRENCY
 const capPerStore = flagValue('cap') ?? Number.MAX_SAFE_INTEGER
 configure({ maxRequests: flagValue('max-requests') ?? DEFAULT_MAX_REQUESTS, verbose })
@@ -58,6 +69,10 @@ const COLUMNS = [
 	'image_urls',
 	'item_specifics',
 	'description',
+	'ships_to',
+	'shipping_cost',
+	'shipping_currency',
+	'shipping_time',
 ]
 
 // --- URLs ---
@@ -83,6 +98,12 @@ const fetchSearchCards: FetchCards = async (url) => parseSearchPage(await fetchH
 
 // Walk one price band of a seller's results, calling onCard for each NEW card.
 // `seen` dedupes across bands. Returns how many new cards this band added.
+//
+// Pages are fetched in concurrent waves of LISTING_WAVE (page numbers are
+// deterministic, so later pages can be requested before earlier ones land) and
+// processed in page order, which keeps the stop conditions exactly as they
+// were while making the walk ~LISTING_WAVE times faster. The tail of a band
+// overshoots by a few cheap search requests; that is the whole cost.
 async function walkBand(
 	seller: string,
 	lo: number | undefined,
@@ -93,20 +114,33 @@ async function walkBand(
 	fetchPage: FetchCards,
 ): Promise<number> {
 	let added = 0
-	for (let page = 1; page <= MAX_PAGES_PER_SEGMENT && seen.size < cap; page++) {
-		const cards = await fetchPage(searchPageURL(seller, page, lo, hi))
-		let newOnPage = 0
-		for (const card of cards) {
-			if (seen.size >= cap) break
-			if (seen.has(card.item_id)) continue
-			seen.add(card.item_id)
-			onCard(card)
-			newOnPage++
-			added++
+	for (let page = 1; page <= MAX_PAGES_PER_SEGMENT && seen.size < cap;) {
+		const wave: Promise<SearchCard[]>[] = []
+		for (let i = 0; i < LISTING_WAVE && page + i <= MAX_PAGES_PER_SEGMENT; i++) {
+			wave.push(fetchPage(searchPageURL(seller, page + i, lo, hi)))
 		}
-		// eBay repeats the last page when _pgn runs past the end: a page with no
-		// new items, or a clearly non-full page, means this band is exhausted.
-		if (newOnPage === 0 || cards.length < 200) break
+		const pages = await Promise.all(wave)
+
+		let exhausted = false
+		for (const cards of pages) {
+			let newOnPage = 0
+			for (const card of cards) {
+				if (seen.size >= cap) break
+				if (seen.has(card.item_id)) continue
+				seen.add(card.item_id)
+				onCard(card)
+				newOnPage++
+				added++
+			}
+			// eBay repeats the last page when _pgn runs past the end: a page with
+			// no new items, or a clearly non-full page, means this band is done.
+			if (newOnPage === 0 || cards.length < 200) {
+				exhausted = true
+				break
+			}
+		}
+		if (exhausted) break
+		page += pages.length
 	}
 	return added
 }
@@ -150,20 +184,35 @@ export async function listStorePageProducts(
 	fetchPage: FetchCards = fetchSearchCards,
 ): Promise<number> {
 	const seen = new Set<string>()
-	for (let page = 1; page <= 500 && seen.size < cap; page++) {
+	const pageURL = (page: number) => {
 		const u = new URL(storeURL)
 		u.searchParams.set('_ipg', '240')
 		u.searchParams.set('_pgn', String(page))
-		const cards = await fetchPage(u.href)
-		let newOnPage = 0
-		for (const card of cards) {
-			if (seen.size >= cap) break
-			if (seen.has(card.item_id)) continue
-			seen.add(card.item_id)
-			onCard(card)
-			newOnPage++
+		return u.href
+	}
+	// Same wave-parallel walk as walkBand: see the comment there.
+	for (let page = 1; page <= 500 && seen.size < cap;) {
+		const wave: Promise<SearchCard[]>[] = []
+		for (let i = 0; i < LISTING_WAVE && page + i <= 500; i++) wave.push(fetchPage(pageURL(page + i)))
+		const pages = await Promise.all(wave)
+
+		let exhausted = false
+		for (const cards of pages) {
+			let newOnPage = 0
+			for (const card of cards) {
+				if (seen.size >= cap) break
+				if (seen.has(card.item_id)) continue
+				seen.add(card.item_id)
+				onCard(card)
+				newOnPage++
+			}
+			if (newOnPage === 0) {
+				exhausted = true
+				break
+			}
 		}
-		if (newOnPage === 0) break
+		if (exhausted) break
+		page += pages.length
 	}
 	return seen.size
 }
@@ -187,10 +236,19 @@ function openDB(): DatabaseSync {
 			title TEXT, sku TEXT, brand TEXT, mpn TEXT,
 			price TEXT, currency TEXT, availability TEXT,
 			image_urls TEXT, item_specifics TEXT, description TEXT,
+			ships_to TEXT, shipping_cost TEXT, shipping_currency TEXT, shipping_time TEXT,
 			error TEXT,
 			updated_at TEXT
 		);
 	`)
+	// Databases created before the shipping columns existed get them added.
+	for (const col of ['ships_to', 'shipping_cost', 'shipping_currency', 'shipping_time']) {
+		try {
+			db.exec(`ALTER TABLE products ADD COLUMN ${col} TEXT`)
+		} catch {
+			// Column already exists.
+		}
+	}
 	return db
 }
 
@@ -325,18 +383,23 @@ async function fetchDescriptions(db: DatabaseSync) {
 	})
 }
 
-// Phase 3 (--full): item page + description per product, both raw, in parallel.
+// Phase 3 (--full): item page (+ description unless --no-desc) per product.
+// With --ship-to the item page is fetched as a viewer from that country, so
+// eBay renders its shipping cost and delivery estimate for free on the same
+// request.
 async function fetchDetails(db: DatabaseSync) {
 	const rows = db.prepare("SELECT item_id FROM products WHERE status IN ('listed', 'pending', 'desc_done', 'failed')")
 		.all() as any[]
 	const save = db.prepare(
 		`UPDATE products SET status = 'done',
 			title = COALESCE(NULLIF(?, ''), title), sku = ?, brand = ?, mpn = ?, price = ?, currency = ?,
-			availability = ?, image_urls = ?, item_specifics = ?, description = ?, updated_at = ?
+			availability = ?, image_urls = ?, item_specifics = ?, description = COALESCE(?, description),
+			ships_to = ?, shipping_cost = ?, shipping_currency = ?, shipping_time = ?, updated_at = ?
 		 WHERE item_id = ?`,
 	)
 	const fail = db.prepare("UPDATE products SET status = 'failed', error = ?, updated_at = ? WHERE item_id = ?")
 
+	const itemFetchOpts = shipTo ? { geolocation: shipTo } : {}
 	console.log(`fetching full details for ${rows.length} products (concurrency ${concurrency})`)
 	const tick = progress(rows.length, 25) // ~every 1.3s at full speed, keeps the web UI lively
 	let budgetHit = false
@@ -345,10 +408,11 @@ async function fetchDetails(db: DatabaseSync) {
 		const now = new Date().toISOString()
 		try {
 			const [pageHTML, descHTML] = await Promise.all([
-				fetchHTML(itemURL(row.item_id)),
-				fetchHTML(descPageURL(row.item_id)),
+				fetchHTML(itemURL(row.item_id), itemFetchOpts),
+				skipDesc ? Promise.resolve(null) : fetchHTML(descPageURL(row.item_id)),
 			])
 			const d = parseItemPage(pageHTML)
+			const ship = shipTo ? parseShipping(pageHTML) : null
 			save.run(
 				d.title,
 				row.item_id,
@@ -359,7 +423,11 @@ async function fetchDetails(db: DatabaseSync) {
 				d.availability,
 				d.image_urls,
 				d.item_specifics,
-				htmlToText(descHTML),
+				descHTML === null ? null : htmlToText(descHTML),
+				ship?.ships_to ?? '',
+				ship?.shipping_cost ?? '',
+				ship?.shipping_currency ?? '',
+				ship?.shipping_time ?? '',
 				now,
 				row.item_id,
 			)
@@ -418,13 +486,37 @@ export class SplitCSVWriter {
 	}
 }
 
+// Convert a row's prices into the target currency, in place. Rows in a
+// currency with no known rate keep their original values.
+function convertRow(row: any, to: string, fx: NonNullable<ReturnType<typeof loadRates>>) {
+	const price = convert(Number(row.price), row.currency || 'USD', to, fx)
+	if (row.price !== '' && row.price != null && price !== null) {
+		row.price = price.toFixed(2)
+		row.currency = to
+	}
+	const shipping = convert(Number(row.shipping_cost), row.shipping_currency || 'USD', to, fx)
+	if (row.shipping_cost !== '' && row.shipping_cost != null && shipping !== null) {
+		row.shipping_cost = shipping.toFixed(2)
+		row.shipping_currency = to
+	}
+}
+
 export function exportCSV() {
 	const db = openDB()
 	const rows = db.prepare(
 		`SELECT ${COLUMNS.join(', ')} FROM products WHERE status IN ('listed', 'pending', 'desc_done', 'done')`,
 	).all() as any[]
+
+	const fx = convertTo ? loadRates(fxPath) : null
+	if (convertTo && !fx) {
+		console.log(`warning: no exchange rates at ${fxPath}; exporting prices unconverted`)
+	}
+
 	const writer = new SplitCSVWriter('products', COLUMNS, ROWS_PER_CSV)
-	for (const row of rows) writer.write(row)
+	for (const row of rows) {
+		if (convertTo && fx) convertRow(row, convertTo, fx)
+		writer.write(row)
+	}
 	writer.close()
 	db.close()
 	console.log(`Exported ${rows.length} products to data/products_*.csv`)

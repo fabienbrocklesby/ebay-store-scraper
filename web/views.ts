@@ -6,6 +6,7 @@ import type { LineError } from './validate.ts'
 import type { JobFile, JobRecord } from './jobs.ts'
 import type { EngineProgress, FriendlyStatus } from './progress.ts'
 import { formatDollars, requestsToDollars } from './money.ts'
+import { SHIP_OPTIONS, shipOption } from './countries.ts'
 
 export function escapeHTML(s: string): string {
 	return s.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
@@ -169,24 +170,30 @@ export interface StatusView {
 	duplicatesNote?: string
 }
 
-// The optional per-run spending limit, tucked away under Technical details.
-// Most jobs run with no limit; this is the advanced escape hatch.
-function budgetForm(v: StatusView): string {
+// Optional per-job tuning, tucked away under Technical details: a spending
+// limit (off by default) and the request parallelism (server default 160).
+function advancedForm(v: StatusView): string {
 	const dollars = v.job.maxRequests === null
 		? ''
 		: String(Math.max(1, Math.round(requestsToDollars(v.job.maxRequests, v.ratePer1k))))
+	const speed = v.job.concurrency === null ? '' : String(v.job.concurrency)
+	const input = 'rounded border border-stone-300 px-2 py-1 text-stone-700 focus:border-stone-500 focus:outline-none'
 	return `<details class="mt-3">
-		<summary class="cursor-pointer select-none">Advanced: spending limit</summary>
-		<form method="post" action="/jobs/${e(v.job.id)}/budget" class="mt-2 flex flex-wrap items-center gap-2">
-			<label for="budget">Pause each run after it spends about</label>
+		<summary class="cursor-pointer select-none">Advanced settings</summary>
+		<form method="post" action="/jobs/${e(v.job.id)}/settings" class="mt-2 flex flex-wrap items-center gap-2">
+			<label for="budget">Pause each run after about</label>
 			<span class="flex items-center gap-1">$<input id="budget" name="budget" type="number" min="1" step="1"
-				value="${dollars}" placeholder="no limit"
-				class="w-24 rounded border border-stone-300 px-2 py-1 text-stone-700 focus:border-stone-500 focus:outline-none"></span>
+				value="${dollars}" placeholder="no limit" class="w-20 ${input}"></span>
+			<label for="speed" class="ml-3">Speed</label>
+			<input id="speed" name="speed" type="number" min="10" max="300" step="10" value="${speed}"
+				placeholder="160" class="w-20 ${input}">
+			<span>parallel requests</span>
 			<button class="rounded border border-stone-300 px-3 py-1 font-medium text-stone-600 hover:bg-stone-50">Save</button>
 		</form>
 		<p class="mt-1">
-			Leave the box empty for no limit. Takes effect the next time the job starts or resumes;
-			a paused job keeps everything it collected and can always be resumed.
+			Empty boxes mean no spending limit and the standard speed. Changes take effect the next
+			time the job starts or resumes; a paused job keeps everything it collected. Speeds far
+			above 160 mostly hit eBay's own limits rather than going faster.
 		</p>
 	</details>`
 }
@@ -206,11 +213,6 @@ export function statusFragment(v: StatusView): string {
 		: ''
 
 	const buttons: string[] = []
-	if (job.status === 'draft') {
-		buttons.push(`<form method="post" action="/jobs/${e(job.id)}/start">
-			<button class="rounded-lg bg-stone-900 px-5 py-2 font-medium text-white hover:bg-stone-700">Start</button>
-		</form>`)
-	}
 	if (friendly.canResume) {
 		buttons.push(`<form method="post" action="/jobs/${e(job.id)}/resume">
 			<button class="rounded-lg bg-stone-900 px-5 py-2 font-medium text-white hover:bg-stone-700">Resume</button>
@@ -256,19 +258,45 @@ export function statusFragment(v: StatusView): string {
 	const limit = job.maxRequests === null
 		? 'none'
 		: `~${formatDollars(requestsToDollars(job.maxRequests, v.ratePer1k))} per run`
+	const dest = shipOption(job.shipTo)
 	const details = `<details class="mt-6 text-xs text-stone-400">
 		<summary class="cursor-pointer select-none">Technical details</summary>
 		<dl class="mt-2 grid grid-cols-2 gap-x-4 gap-y-1 sm:grid-cols-4">
 			<dt>Spent this run</dt><dd>~${formatDollars(requestsToDollars(progress.requestsUsed, v.ratePer1k))}</dd>
 			<dt>Requests used</dt><dd>${progress.requestsUsed.toLocaleString('en-US')}</dd>
 			<dt>Spending limit</dt><dd>${limit}</dd>
+			<dt>Ships to</dt><dd>${dest ? `${e(dest.label)} (${dest.currency})` : 'not set'}</dd>
 			<dt>Speed</dt><dd>${
 		progress.ratePerMin > 0 ? `${progress.ratePerMin.toLocaleString('en-US')} products/min` : 'n/a'
 	}</dd>
 			<dt>Job ID</dt><dd>${e(job.id)}</dd>
 		</dl>
-		${budgetForm(v)}
+		${advancedForm(v)}
 	</details>`
+
+	// Drafts start from a small form that picks the shipping destination:
+	// shipping cost, delivery time, and the output currency all follow it.
+	let startBlock = ''
+	if (job.status === 'draft') {
+		const selected = job.shipTo ?? 'NZ'
+		const options = SHIP_OPTIONS.map((o) =>
+			`<option value="${o.code}"${o.code === selected ? ' selected' : ''}>${e(o.label)}</option>`
+		).join('') + '<option value="">No country (prices as listed)</option>'
+		startBlock = `<div class="mt-5 rounded-lg bg-stone-50 p-4">
+			<form method="post" action="/jobs/${e(job.id)}/start" class="flex flex-wrap items-end gap-3">
+				<label class="block text-sm text-stone-600">Ship to
+					<select name="shipto" class="mt-1 block rounded-lg border border-stone-300 bg-white px-3 py-2 text-stone-800">
+						${options}
+					</select>
+				</label>
+				<button class="rounded-lg bg-stone-900 px-5 py-2 font-medium text-white hover:bg-stone-700">Start</button>
+			</form>
+			<p class="mt-2 text-xs text-stone-500">
+				Every product gets the shipping cost and delivery time to this country (when the seller
+				offers it), and all prices are converted to its currency.
+			</p>
+		</div>`
+	}
 
 	const spinner = running
 		? `<span class="inline-block h-4 w-4 animate-spin rounded-full border-2 border-stone-300 border-t-stone-900" aria-hidden="true"></span>`
@@ -285,6 +313,7 @@ export function statusFragment(v: StatusView): string {
 		</div>
 		<div class="flex shrink-0 gap-2 pt-1">${buttons.join('\n')}</div>
 	</div>
+	${startBlock}
 	${bar}
 	${fileList}
 	${details}`
@@ -305,7 +334,9 @@ export function jobPage(v: StatusView): string {
 		`
 	<p class="mb-3 text-sm text-stone-500"><a href="/" class="hover:text-stone-800">&larr; All jobs</a></p>
 	<section class="rounded-xl bg-white p-6 shadow-sm">
-		<p class="mb-1 text-sm text-stone-400">${e(v.job.name)} &middot; ${v.job.storeCount} stores</p>
+		<p class="mb-1 text-sm text-stone-400">${e(v.job.name)} &middot; ${v.job.storeCount} stores${
+			shipOption(v.job.shipTo) ? ` &middot; shipping to ${e(shipOption(v.job.shipTo)!.label)}` : ''
+		}</p>
 		${statusWrapper(v)}
 	</section>
 	<p class="mt-4 text-center text-sm text-stone-400">

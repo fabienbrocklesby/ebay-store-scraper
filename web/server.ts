@@ -17,6 +17,7 @@ import { friendlyStatus, type JobStatus } from './progress.ts'
 import { homePage, jobPage, loginPage, type StatusView, statusWrapper } from './views.ts'
 import { parseStoresFile } from './validate.ts'
 import { dollarsToRequests } from './money.ts'
+import { shipOption } from './countries.ts'
 
 // --- configuration ---
 
@@ -59,6 +60,9 @@ const jobs = new JobManager({
 	exportScript: new URL('../engine/export.ts', import.meta.url).pathname,
 	concurrency: SCRAPE_CONCURRENCY,
 	maxRequestsPerJob: MAX_REQUESTS_PER_JOB,
+	// Seller descriptions are off by default (they double the per-product
+	// request count); set SCRAPE_DESCRIPTIONS=on to fetch them again.
+	includeDescriptions: (Deno.env.get('SCRAPE_DESCRIPTIONS') ?? '').toLowerCase() === 'on',
 	// For cheap smoke tests only, e.g. SCRAPE_EXTRA_ARGS='--cap=4'. See TESTING.md.
 	extraArgs: (Deno.env.get('SCRAPE_EXTRA_ARGS') ?? '').split(/\s+/).filter(Boolean),
 })
@@ -181,19 +185,40 @@ async function handleUpload(req: Request): Promise<Response> {
 async function handleJobAction(req: Request, id: string, action: string): Promise<Response> {
 	const job = jobs.get(id)
 	if (!job) return new Response('Not found', { status: 404 })
-	if (action === 'start' || action === 'resume') jobs.enqueue(id)
+	if (action === 'start' || action === 'resume') {
+		if (action === 'start') {
+			// The Start form carries the shipping destination.
+			try {
+				const form = await req.formData()
+				const dest = shipOption(String(form.get('shipto') ?? ''))
+				jobs.update(id, { shipTo: dest?.code ?? null })
+			} catch {
+				// Plain start, keep whatever the job already has.
+			}
+		}
+		jobs.enqueue(id)
+	}
 	if (action === 'stop') jobs.stop(id)
-	if (action === 'budget') {
-		// The advanced form posts a dollar figure; empty clears the limit, junk
-		// leaves it unchanged.
+	if (action === 'settings') {
+		// The advanced form posts a dollar limit and a speed; empty clears each
+		// back to the default, junk leaves it unchanged.
 		try {
 			const form = await req.formData()
-			const raw = String(form.get('budget') ?? '').trim()
-			if (raw === '') {
-				jobs.setBudget(id, null)
+			const budgetRaw = String(form.get('budget') ?? '').trim()
+			if (budgetRaw === '') {
+				jobs.update(id, { maxRequests: null })
 			} else {
-				const requests = dollarsToRequests(Number(raw), COST_PER_1K_USD)
-				if (requests > 0) jobs.setBudget(id, requests)
+				const requests = dollarsToRequests(Number(budgetRaw), COST_PER_1K_USD)
+				if (requests > 0) jobs.update(id, { maxRequests: requests })
+			}
+			const speedRaw = String(form.get('speed') ?? '').trim()
+			if (speedRaw === '') {
+				jobs.update(id, { concurrency: null })
+			} else {
+				const speed = Math.round(Number(speedRaw))
+				if (Number.isFinite(speed) && speed > 0) {
+					jobs.update(id, { concurrency: Math.min(300, Math.max(10, speed)) })
+				}
 			}
 		} catch {
 			// No form body; nothing to change.

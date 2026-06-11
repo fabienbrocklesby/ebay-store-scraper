@@ -8,6 +8,7 @@
 // in the same folder resumes exactly where it left off.
 
 import { type EngineProgress, type JobStatus, parseLog, RUN_MARKER_PREFIX } from './progress.ts'
+import { shipOption } from './countries.ts'
 
 export interface JobRecord {
 	id: string
@@ -20,6 +21,8 @@ export interface JobRecord {
 	finishedAt: string | null
 	pid: number | null
 	maxRequests: number | null // per-run spending stop in requests; null = no limit
+	concurrency: number | null // parallel requests; null = server default
+	shipTo: string | null // destination country code; null = no shipping data
 }
 
 export interface JobFile {
@@ -33,6 +36,7 @@ export interface JobsConfig {
 	exportScript: string // absolute path to export.ts
 	concurrency: number
 	maxRequestsPerJob: number | null // default limit for new jobs; null = none
+	includeDescriptions: boolean // fetch seller descriptions (2nd request/product)
 	extraArgs?: string[] // extra engine flags, e.g. ['--cap=4'] for cheap smoke tests
 }
 
@@ -127,6 +131,8 @@ export class JobManager {
 			finishedAt: null,
 			pid: null,
 			maxRequests: this.config.maxRequestsPerJob,
+			concurrency: null,
+			shipTo: null,
 		}
 		Deno.mkdirSync(`${this.jobDir(job.id)}/data`, { recursive: true })
 		Deno.writeTextFileSync(`${this.jobDir(job.id)}/data/stores_all.txt`, storeURLs.join('\n') + '\n')
@@ -146,12 +152,12 @@ export class JobManager {
 		return this.get(id)
 	}
 
-	// Set or clear the per-run spending stop. Takes effect on the next run; a
-	// run already in flight keeps the budget it started with.
-	setBudget(id: string, maxRequests: number | null): JobRecord | null {
+	// Update job settings (spending stop, speed, destination). They take
+	// effect on the next run; a run already in flight keeps what it started with.
+	update(id: string, patch: Partial<Pick<JobRecord, 'maxRequests' | 'concurrency' | 'shipTo'>>): JobRecord | null {
 		const job = this.get(id)
 		if (!job) return null
-		this.save({ ...job, maxRequests })
+		this.save({ ...job, ...patch })
 		return this.get(id)
 	}
 
@@ -218,15 +224,61 @@ export class JobManager {
 		}
 	}
 
-	// If nothing is running, start the oldest queued job.
+	// If nothing is running or starting, start the oldest queued job.
+	private starting = false
+
 	private tick() {
+		if (this.starting) return
 		const jobs = this.list()
 		if (jobs.some((j) => j.status === 'running')) return
 		const next = jobs.filter((j) => j.status === 'queued').sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0]
-		if (next) this.spawn(next)
+		if (!next) return
+		this.starting = true
+		this.spawn(next)
+			.catch((err) => {
+				this.save({
+					...next,
+					status: 'failed',
+					statusReason: `The job could not start: ${(err as Error).message}`,
+					pid: null,
+				})
+			})
+			.finally(() => {
+				this.starting = false
+			})
 	}
 
-	private spawn(job: JobRecord) {
+	// Fresh exchange rates for a job that converts currency: one free API call,
+	// cached server-wide so a flaky rates API never blocks a job.
+	private async ensureFxRates(job: JobRecord, currency: string): Promise<boolean> {
+		const fxPath = `${this.jobDir(job.id)}/data/fx.json`
+		const cachePath = `${this.config.dataDir}/fx-cache.json`
+		try {
+			const res = await fetch('https://open.er-api.com/v6/latest/USD', { signal: AbortSignal.timeout(10000) })
+			const data = await res.json()
+			if (data?.rates?.[currency]) {
+				const fx = JSON.stringify({ base: 'USD', rates: data.rates })
+				Deno.writeTextFileSync(fxPath, fx)
+				Deno.writeTextFileSync(cachePath, fx)
+				return true
+			}
+		} catch {
+			// Fall through to the cache.
+		}
+		try {
+			Deno.copyFileSync(cachePath, fxPath)
+			return true
+		} catch {
+			return false
+		}
+	}
+
+	private async spawn(job: JobRecord) {
+		const dest = shipOption(job.shipTo)
+		// Without rates the job still runs and collects shipping data; only the
+		// currency conversion is skipped (prices stay as listed).
+		const haveFx = dest ? await this.ensureFxRates(job, dest.currency) : false
+
 		const log = Deno.openSync(this.logPath(job.id), { create: true, append: true })
 		log.writeSync(new TextEncoder().encode(`${RUN_MARKER_PREFIX} started ${new Date().toISOString()} ===\n`))
 
@@ -239,8 +291,11 @@ export class JobManager {
 				'--allow-env',
 				this.config.scrapeScript,
 				'--full',
-				`--concurrency=${this.config.concurrency}`,
+				...(this.config.includeDescriptions ? [] : ['--no-desc']),
+				`--concurrency=${job.concurrency ?? this.config.concurrency}`,
 				`--max-requests=${job.maxRequests ?? UNLIMITED_REQUESTS}`,
+				...(dest ? [`--ship-to=${dest.code}`] : []),
+				...(dest && haveFx ? [`--convert-to=${dest.currency}`] : []),
 				...(this.config.extraArgs ?? []),
 			],
 			cwd: this.jobDir(job.id),
