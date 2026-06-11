@@ -17,7 +17,14 @@
 
 import { DatabaseSync } from 'node:sqlite'
 import { BudgetExceeded, configure, fetchHTML, requestsMade } from './zyte.ts'
-import { htmlToText, parseItemPage, parseSearchPage, parseShipping, type SearchCard } from './parse.ts'
+import {
+	htmlToText,
+	parseItemPage,
+	parseResultCount,
+	parseSearchPage,
+	parseShipping,
+	type SearchCard,
+} from './parse.ts'
 import { convert, loadRates } from './fx.ts'
 
 // --- knobs ---
@@ -29,6 +36,8 @@ const SEGMENT_CAP = 9000 // eBay stops serving a search past ~10k results; a
 // price band that yields this many gets split in half and re-walked.
 const MAX_PAGES_PER_SEGMENT = 45
 const LISTING_WAVE = 5 // search pages fetched concurrently while walking one store
+const PAGE_REFETCHES = 1 // refetches of a page that added nothing before counting it
+const END_OF_BAND_PAGES = 2 // consecutive nothing-new pages that end a band
 const ROWS_PER_CSV = 50000
 const DB_PATH = './data/scrape.db'
 
@@ -93,17 +102,36 @@ function searchPageURL(seller: string, page: number, lo?: number, hi?: number): 
 
 // --- listing walk ---
 
-type FetchCards = (url: string) => Promise<SearchCard[]>
-const fetchSearchCards: FetchCards = async (url) => parseSearchPage(await fetchHTML(url))
+export type SearchPage = { cards: SearchCard[]; total: number | null }
+type FetchPage = (url: string) => Promise<SearchPage>
+const fetchSearchPage: FetchPage = async (url) => {
+	const html = await fetchHTML(url)
+	return { cards: parseSearchPage(html), total: parseResultCount(html) }
+}
 
 // Walk one price band of a seller's results, calling onCard for each NEW card.
-// `seen` dedupes across bands. Returns how many new cards this band added.
+// `seen` dedupes across bands. Returns how many new cards this band added and
+// eBay's own result count for the band (from the first page that carried
+// cards; the figure caps at 15,000+ for big sets, which is still enough to
+// know the band overflows the ceiling).
 //
 // Pages are fetched in concurrent waves of LISTING_WAVE (page numbers are
 // deterministic, so later pages can be requested before earlier ones land) and
-// processed in page order, which keeps the stop conditions exactly as they
-// were while making the walk ~LISTING_WAVE times faster. The tail of a band
-// overshoots by a few cheap search requests; that is the whole cost.
+// processed in page order. The tail of a band overshoots by a few cheap
+// search requests; that is the whole cost.
+//
+// End-of-band detection has to survive two eBay flakes seen in the wild, both
+// of which look exactly like the end of the results:
+//   - a fully-formed page with zero cards and a "0 results" heading, served
+//     transiently even for sellers with 150k live listings
+//   - a full page containing only already-seen items, because the ordering of
+//     same-price items shifts between requests and a page's window can slide
+//     entirely into territory another page already covered
+// So no single page is believed: a page that adds nothing new is refetched,
+// and the band only ends after two consecutive page numbers confirm there is
+// nothing more. (The genuine end signal is eBay repeating the last page once
+// _pgn runs past the end.) The extra confirmation costs a few search requests
+// per band; missing items costs the whole tail of a store.
 async function walkBand(
 	seller: string,
 	lo: number | undefined,
@@ -111,66 +139,91 @@ async function walkBand(
 	cap: number,
 	seen: Set<string>,
 	onCard: (c: SearchCard) => void,
-	fetchPage: FetchCards,
-): Promise<number> {
+	fetchPage: FetchPage,
+	stopWhenOverCap: boolean,
+): Promise<{ added: number; total: number | null }> {
 	let added = 0
+	let total: number | null = null
+	let zeroStreak = 0 // consecutive pages that added nothing, across waves
+	const collect = (cards: SearchCard[]) => {
+		let fresh = 0
+		for (const card of cards) {
+			if (seen.size >= cap) break
+			if (seen.has(card.item_id)) continue
+			seen.add(card.item_id)
+			onCard(card)
+			fresh++
+			added++
+		}
+		return fresh
+	}
+
 	for (let page = 1; page <= MAX_PAGES_PER_SEGMENT && seen.size < cap;) {
-		const wave: Promise<SearchCard[]>[] = []
+		const wave: Promise<SearchPage>[] = []
 		for (let i = 0; i < LISTING_WAVE && page + i <= MAX_PAGES_PER_SEGMENT; i++) {
 			wave.push(fetchPage(searchPageURL(seller, page + i, lo, hi)))
 		}
 		const pages = await Promise.all(wave)
 
 		let exhausted = false
-		for (const cards of pages) {
-			let newOnPage = 0
-			for (const card of cards) {
-				if (seen.size >= cap) break
-				if (seen.has(card.item_id)) continue
-				seen.add(card.item_id)
-				onCard(card)
-				newOnPage++
-				added++
+		for (let i = 0; i < pages.length; i++) {
+			let { cards, total: pageTotal } = pages[i]
+			let newOnPage = collect(cards)
+			for (let retry = 0; newOnPage === 0 && retry < PAGE_REFETCHES; retry++) {
+				if (verbose) console.log(`    page ${page + i} of ${seller} added nothing, refetching`)
+				;({ cards, total: pageTotal } = await fetchPage(searchPageURL(seller, page + i, lo, hi)))
+				newOnPage = collect(cards)
 			}
-			// eBay repeats the last page when _pgn runs past the end: a page with
-			// no new items, or a clearly non-full page, means this band is done.
-			if (newOnPage === 0 || cards.length < 200) {
-				exhausted = true
-				break
+			if (total === null && cards.length > 0) total = pageTotal
+
+			if (newOnPage === 0) {
+				zeroStreak++
+				if (zeroStreak >= END_OF_BAND_PAGES) {
+					exhausted = true
+					break
+				}
+			} else {
+				zeroStreak = 0
 			}
 		}
 		if (exhausted) break
+		// The band overflows eBay's ~10k serving ceiling and the caller can
+		// split it: stop walking, the split halves cover everything anyway.
+		if (stopWhenOverCap && total !== null && total > SEGMENT_CAP) break
 		page += pages.length
 	}
-	return added
+	return { added, total }
 }
 
-// List a seller's full catalog. A band that hits eBay's ~10k search ceiling is
-// split in half (price-wise) and both halves re-walked, until every band fits.
-// `fetchPage` is injectable for testing.
+// List a seller's full catalog. A band that hits eBay's ~10k search ceiling,
+// by its own reported result count or by the number of cards actually served,
+// is split in half (price-wise) and both halves re-walked, until every band
+// fits. `fetchPage` is injectable for testing.
 export async function listStoreProducts(
 	seller: string,
 	cap: number,
 	onCard: (c: SearchCard) => void,
-	fetchPage: FetchCards = fetchSearchCards,
+	fetchPage: FetchPage = fetchSearchPage,
 ): Promise<number> {
 	const seen = new Set<string>()
 	const bands: Array<[number | undefined, number | undefined]> = [[undefined, undefined]]
 
 	while (bands.length > 0 && seen.size < cap) {
 		const [lo, hi] = bands.pop()!
-		const got = await walkBand(seller, lo, hi, cap, seen, onCard, fetchPage)
-		if (got < SEGMENT_CAP) continue // band fit inside the ceiling
-
 		const floor = lo ?? 0
+		// A band narrower than $1 that still overflows is accepted as-is.
+		const splittable = hi === undefined || hi - floor > 1
+		const { added, total } = await walkBand(seller, lo, hi, cap, seen, onCard, fetchPage, splittable)
+		const overflowed = added >= SEGMENT_CAP || (total !== null && total > SEGMENT_CAP)
+		if (!overflowed || !splittable) continue
+
 		if (hi === undefined) {
 			const mid = floor > 0 ? floor * 2 : 100
 			bands.push([floor, mid], [mid, undefined])
-		} else if (hi - floor > 1) {
+		} else {
 			const mid = (floor + hi) / 2
 			bands.push([floor, mid], [mid, hi])
 		}
-		// A band narrower than $1 that still overflows is accepted as-is.
 	}
 	return seen.size
 }
@@ -181,7 +234,7 @@ export async function listStorePageProducts(
 	storeURL: string,
 	cap: number,
 	onCard: (c: SearchCard) => void,
-	fetchPage: FetchCards = fetchSearchCards,
+	fetchPage: FetchPage = fetchSearchPage,
 ): Promise<number> {
 	const seen = new Set<string>()
 	const pageURL = (page: number) => {
@@ -190,25 +243,41 @@ export async function listStorePageProducts(
 		u.searchParams.set('_pgn', String(page))
 		return u.href
 	}
-	// Same wave-parallel walk as walkBand: see the comment there.
+	// Same wave-parallel walk and flake-proof end detection as walkBand.
+	const collect = (cards: SearchCard[]) => {
+		let fresh = 0
+		for (const card of cards) {
+			if (seen.size >= cap) break
+			if (seen.has(card.item_id)) continue
+			seen.add(card.item_id)
+			onCard(card)
+			fresh++
+		}
+		return fresh
+	}
+	let zeroStreak = 0
 	for (let page = 1; page <= 500 && seen.size < cap;) {
-		const wave: Promise<SearchCard[]>[] = []
+		const wave: Promise<SearchPage>[] = []
 		for (let i = 0; i < LISTING_WAVE && page + i <= 500; i++) wave.push(fetchPage(pageURL(page + i)))
 		const pages = await Promise.all(wave)
 
 		let exhausted = false
-		for (const cards of pages) {
-			let newOnPage = 0
-			for (const card of cards) {
-				if (seen.size >= cap) break
-				if (seen.has(card.item_id)) continue
-				seen.add(card.item_id)
-				onCard(card)
-				newOnPage++
+		for (let i = 0; i < pages.length; i++) {
+			let { cards } = pages[i]
+			let newOnPage = collect(cards)
+			for (let retry = 0; newOnPage === 0 && retry < PAGE_REFETCHES; retry++) {
+				if (verbose) console.log(`    store page ${page + i} added nothing, refetching`)
+				;({ cards } = await fetchPage(pageURL(page + i)))
+				newOnPage = collect(cards)
 			}
 			if (newOnPage === 0) {
-				exhausted = true
-				break
+				zeroStreak++
+				if (zeroStreak >= END_OF_BAND_PAGES) {
+					exhausted = true
+					break
+				}
+			} else {
+				zeroStreak = 0
 			}
 		}
 		if (exhausted) break

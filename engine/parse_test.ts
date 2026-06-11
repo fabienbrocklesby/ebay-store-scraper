@@ -1,7 +1,7 @@
 // Unit tests for the pure HTML parsers, against compact synthetic fixtures
 // that mirror eBay's real markup anchors.
 import { assertEquals } from '@std/assert'
-import { htmlToText, parseItemPage, parseSearchPage, parseShipping } from './parse.ts'
+import { htmlToText, parseItemPage, parseResultCount, parseSearchPage, parseShipping } from './parse.ts'
 
 function card(id: string, title: string, price = '18.20', img = 'zKQAAOSwFnFWFVhC') {
 	return `<li class="s-card s-card--horizontal" data-listingid=${id}>
@@ -47,6 +47,19 @@ Deno.test('parseSearchPage handles the store-page (str-item-card) layout', () =>
 		currency: 'USD',
 		image_url: 'https://i.ebayimg.com/images/g/HLcAAOSwx9FlsUJ5/s-l1600.jpg',
 	}])
+})
+
+Deno.test('parseResultCount reads exact and capped ("15,000+") counts', () => {
+	// Real markup: the count sits in the srp-controls heading, often wrapped in
+	// framework comment nodes.
+	const heading = (text: string) =>
+		`<div class="srp-controls__control srp-controls__count">
+			<h1 class=srp-controls__count-heading><!--F#f_0-->${text}<!--F/--></h1></div>`
+	assertEquals(parseResultCount(heading('153 results')), 153)
+	assertEquals(parseResultCount(heading('1 result')), 1)
+	assertEquals(parseResultCount(heading('15,000+ results')), 15000)
+	assertEquals(parseResultCount(heading('0 results')), 0)
+	assertEquals(parseResultCount('<html><body>no heading</body></html>'), null)
 })
 
 const ITEM_PAGE = `<html><head><title>Control Arm Kit for BMW | eBay</title></head><body>
