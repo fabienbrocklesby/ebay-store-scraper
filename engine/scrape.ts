@@ -249,13 +249,29 @@ async function listStores(db: DatabaseSync) {
 	const setStatus = db.prepare('UPDATE stores SET status = ?, error = ? WHERE store_name = ?')
 
 	console.log(`listing ${stores.length} stores (concurrency ${concurrency})`)
+
+	// A live "found so far" line at most every 2 seconds, so a long walk of a
+	// big store reads as progress rather than silence.
+	let found = 0
+	let lastFoundNote = performance.now()
+	const noteFound = () => {
+		found++
+		const now = performance.now()
+		if (now - lastFoundNote < 2000) return
+		lastFoundNote = now
+		console.log(`  found ${found} products so far (${requestsMade()} requests)`)
+	}
+
 	let budgetHit = false
 	await runPool(stores, concurrency, async (store) => {
 		if (budgetHit) return
+		console.log(`checking ${store.store_name}`)
 		try {
 			const now = new Date().toISOString()
-			const save = (c: SearchCard) =>
+			const save = (c: SearchCard) => {
 				insert.run(c.item_id, itemURL(c.item_id), store.store_name, c.title, c.price, c.currency, c.image_url, now)
+				noteFound()
+			}
 
 			let count = await listStoreProducts(store.store_name, capPerStore, save)
 			if (count === 0) count = await listStorePageProducts(store.store_url, capPerStore, save)

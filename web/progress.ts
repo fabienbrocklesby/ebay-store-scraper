@@ -24,10 +24,13 @@ export type Phase = 'starting' | 'listing' | 'descriptions' | 'details' | 'finis
 
 export interface EngineProgress {
 	phase: Phase
+	runStartedAt: string | null // ISO timestamp from the run marker line
 	storesTotal: number
 	storesChecked: number // listed + empty + failed
 	storesFailed: number
-	productsFound: number // running total from per-store listing lines
+	checkingStores: string[] // started but not yet finished, in start order
+	productsFound: number // best live count from the listing phase
+	completedListed: number // sum of per-store "listed" completion lines
 	productsTotal: number // total of the current desc/details phase
 	productsDone: number
 	ratePerMin: number // products per minute, from the engine's progress line
@@ -40,10 +43,13 @@ export interface EngineProgress {
 export function newProgress(): EngineProgress {
 	return {
 		phase: 'starting',
+		runStartedAt: null,
 		storesTotal: 0,
 		storesChecked: 0,
 		storesFailed: 0,
+		checkingStores: [],
 		productsFound: 0,
+		completedListed: 0,
 		productsTotal: 0,
 		productsDone: 0,
 		ratePerMin: 0,
@@ -62,7 +68,10 @@ export function feedLine(p: EngineProgress, line: string): EngineProgress {
 
 	// A resume re-runs every phase header, so a fresh state per run is correct.
 	if (line.startsWith(RUN_MARKER_PREFIX)) {
-		return Object.assign(p, newProgress())
+		const started = line.match(/^=== run started (\S+) ===/)
+		Object.assign(p, newProgress())
+		p.runStartedAt = started ? started[1] : null
+		return p
 	}
 
 	if ((m = line.match(/^listing (\d+) stores/))) {
@@ -70,15 +79,27 @@ export function feedLine(p: EngineProgress, line: string): EngineProgress {
 		p.storesTotal = Number(m[1])
 		return p
 	}
-	if ((m = line.match(/^(listed|empty)\s+\S+: (\d+) products \((\d+) requests\)/))) {
-		p.storesChecked++
-		p.productsFound += Number(m[2])
-		p.requestsUsed = Number(m[3])
+	if ((m = line.match(/^checking (\S+)$/))) {
+		p.checkingStores.push(m[1])
 		return p
 	}
-	if (line.startsWith('FAILED  ')) {
+	if ((m = line.match(/^\s+found (\d+) products so far \((\d+) requests\)/))) {
+		p.productsFound = Math.max(p.productsFound, Number(m[1]))
+		p.requestsUsed = Number(m[2])
+		return p
+	}
+	if ((m = line.match(/^(listed|empty)\s+(\S+): (\d+) products \((\d+) requests\)/))) {
+		p.storesChecked++
+		p.completedListed += Number(m[3])
+		p.productsFound = Math.max(p.productsFound, p.completedListed)
+		p.requestsUsed = Number(m[4])
+		p.checkingStores = p.checkingStores.filter((s) => s !== m![2])
+		return p
+	}
+	if ((m = line.match(/^FAILED\s+(\S+):/))) {
 		p.storesChecked++
 		p.storesFailed++
+		p.checkingStores = p.checkingStores.filter((s) => s !== m![1])
 		return p
 	}
 	if ((m = line.match(/^fetching (\d+) descriptions/))) {
@@ -155,17 +176,29 @@ export function timeLeft(remaining: number, perMin: number): string {
 
 const RESUME_NOTE = 'No work was lost: press Resume and it continues where it stopped.'
 
-function runningStatus(p: EngineProgress): FriendlyStatus {
+function runningStatus(p: EngineProgress, minutesElapsed?: number): FriendlyStatus {
 	switch (p.phase) {
 		case 'starting':
 			return { headline: 'Starting up...', detail: '', percent: null, canResume: false }
 		case 'listing': {
-			const checked = p.storesTotal > 0 ? `${n(p.storesChecked)} of ${n(p.storesTotal)} stores checked` : ''
+			const checked = p.storesTotal > 1 ? `${n(p.storesChecked)} of ${n(p.storesTotal)} stores checked` : ''
 			const found = p.productsFound > 0 ? `${n(p.productsFound)} products found so far` : ''
+			const names = p.checkingStores.slice(0, 3).join(', ') +
+				(p.checkingStores.length > 3 ? ` and ${n(p.checkingStores.length - 3)} more` : '')
+			const checking = names ? `now checking ${names}` : ''
+			// A rough step ETA once some stores have completed: store sizes vary
+			// wildly, so this firms up as more of them finish.
+			const eta = minutesElapsed && minutesElapsed > 0 && p.storesChecked > 0 && p.storesTotal > p.storesChecked
+				? timeLeft(p.storesTotal - p.storesChecked, p.storesChecked / minutesElapsed)
+					.replace(' left', ' left in this step')
+				: ''
+			const headline = p.storesTotal === 1 && p.checkingStores.length === 1
+				? `Finding products in ${p.checkingStores[0]}...`
+				: `Finding products in ${n(p.storesTotal)} ${p.storesTotal === 1 ? 'store' : 'stores'}...`
 			return {
-				headline: `Finding products in ${n(p.storesTotal)} stores...`,
-				detail: [checked, found].filter(Boolean).join(', '),
-				percent: p.storesTotal > 0 ? Math.floor((p.storesChecked / p.storesTotal) * 100) : null,
+				headline,
+				detail: [checked, found, p.storesTotal === 1 ? '' : checking, eta].filter(Boolean).join(', '),
+				percent: p.storesTotal > 1 ? Math.floor((p.storesChecked / p.storesTotal) * 100) : null,
 				canResume: false,
 			}
 		}
@@ -214,6 +247,7 @@ export function friendlyStatus(
 	status: JobStatus,
 	p: EngineProgress,
 	queueAhead: number,
+	minutesElapsed?: number, // wall time of the current run, for the listing ETA
 ): FriendlyStatus {
 	switch (status) {
 		case 'draft':
@@ -233,7 +267,7 @@ export function friendlyStatus(
 				canResume: false,
 			}
 		case 'running':
-			return runningStatus(p)
+			return runningStatus(p, minutesElapsed)
 		case 'interrupted':
 			return {
 				headline: 'This job was interrupted.',

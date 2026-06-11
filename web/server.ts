@@ -102,20 +102,23 @@ const redirect = (to: string, headers: Record<string, string> = {}) =>
 
 function statusView(job: JobRecord): StatusView {
 	const progress = jobs.progress(job.id)
+	// Wall time of the current run, for the listing phase's rough ETA.
+	let minutesElapsed: number | undefined
+	if (job.status === 'running' && progress.runStartedAt) {
+		const t = Date.parse(progress.runStartedAt)
+		if (Number.isFinite(t)) minutesElapsed = Math.max(0, (Date.now() - t) / 60000)
+	}
 	return {
 		job,
 		progress,
-		friendly: friendlyStatus(job.status as JobStatus, progress, jobs.queueAhead(job.id)),
+		friendly: friendlyStatus(job.status as JobStatus, progress, jobs.queueAhead(job.id), minutesElapsed),
 		files: jobs.files(job.id),
 		ratePer1k: COST_PER_1K_USD,
 	}
 }
 
 function renderHome(upload?: { errors: ReturnType<typeof parseStoresFile>['errors']; fileName: string }): string {
-	const rows = jobs.list().map((job) => ({
-		job,
-		headline: friendlyStatus(job.status as JobStatus, jobs.progress(job.id), jobs.queueAhead(job.id)).headline,
-	}))
+	const rows = jobs.list().map((job) => ({ job, headline: statusView(job).friendly.headline }))
 	return homePage(rows, upload)
 }
 

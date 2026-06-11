@@ -86,6 +86,42 @@ Deno.test('friendly status: running details phase shows counts, percent and time
 	assertEquals(s.percent, 3)
 })
 
+Deno.test('the run marker carries the run start time', () => {
+	const p = parseLog(SAMPLE_RUN)
+	assertEquals(p.runStartedAt, '2026-06-11T00:00:00.000Z')
+})
+
+Deno.test('live listing lines: checking stores and a found-so-far counter', () => {
+	const p = parseLog(`listing 3 stores (concurrency 160)
+checking alpha
+checking bravo
+checking charlie
+  found 2400 products so far (12 requests)
+listed  bravo: 1900 products (15 requests)
+`)
+	assertEquals(p.checkingStores, ['alpha', 'charlie'])
+	assertEquals(p.productsFound, 2400) // live counter still ahead of completions
+	assertEquals(p.completedListed, 1900)
+	assertEquals(p.requestsUsed, 15)
+})
+
+Deno.test('friendly status: a single-store listing names the store and counts up', () => {
+	const p = parseLog(`=== run started 2026-06-11T00:00:00.000Z ===
+listing 1 stores (concurrency 160)
+checking tlautopart
+  found 2400 products so far (11 requests)
+`)
+	const s = friendlyStatus('running', p, 0)
+	assertEquals(s.headline, 'Finding products in tlautopart...')
+	assertEquals(s.detail, '2,400 products found so far')
+})
+
+Deno.test('friendly status: listing gains a rough step ETA once stores complete', () => {
+	const s = friendlyStatus('running', parseLog(SAMPLE_RUN.split('\n').slice(0, 5).join('\n')), 0, 3)
+	// 3 stores checked in 3 minutes leaves 109 stores at ~1/min
+	assertEquals(s.detail.endsWith('about 2 hours left in this step'), true)
+})
+
 Deno.test('friendly status: listing phase talks about stores, not requests', () => {
 	const s = friendlyStatus('running', parseLog(SAMPLE_RUN.split('\n').slice(0, 5).join('\n')), 0)
 	assertEquals(s.headline, 'Finding products in 112 stores...')
