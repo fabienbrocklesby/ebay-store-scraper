@@ -27,8 +27,9 @@ upload stores.txt ──> file checked, line-numbered errors if anything is off
 What it guarantees:
 
 - **The file is validated before anything starts.** Accepted lines:
-  `https://www.ebay.com/str/storename` (trailing slashes, query strings, bare
-  slugs, and missing scheme/www are tolerated and normalized). Anything else
+  `https://www.ebay.com/str/storename`, eBay seller-search links
+  (`/sch/i.html?_ssn=seller&...`), and bare slugs; trailing slashes, query
+  strings, and missing scheme/www are tolerated and normalized. Anything else
   is rejected with its line number. No job is created from a bad file.
 - **One job runs at a time.** The Zyte account and its 3,000 requests/min cap
   are shared, so further jobs queue FIFO ("Waiting in line behind 1 other job").

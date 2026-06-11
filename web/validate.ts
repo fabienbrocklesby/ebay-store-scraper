@@ -66,15 +66,28 @@ function slugFromLine(text: string): { slug?: string; problem?: string } {
 	}
 
 	const segments = url.pathname.split('/').filter(Boolean)
-	if (segments.length < 2 || segments[0].toLowerCase() !== 'str') {
-		return { problem: `is an eBay link but not a store link. ${EXAMPLE}` }
+	if (segments.length >= 2 && segments[0].toLowerCase() === 'str') {
+		const slug = segments[1]
+		if (!SLUG_RE.test(slug)) {
+			return { problem: `has a store name with unexpected characters. ${EXAMPLE}` }
+		}
+		return { slug }
 	}
 
-	const slug = segments[1]
-	if (!SLUG_RE.test(slug)) {
-		return { problem: `has a store name with unexpected characters. ${EXAMPLE}` }
+	// Seller-search links, the kind eBay's own pages hand out:
+	//   /sch/i.html?_ssn=sellername&store_name=storeslug&_oac=1...
+	// _ssn is the seller username, which is what the engine's primary search
+	// path needs; store_name is the store slug and can differ, so it is only
+	// the fallback.
+	const seller = url.searchParams.get('_ssn') || url.searchParams.get('store_name')
+	if (seller) {
+		if (!SLUG_RE.test(seller)) {
+			return { problem: `has a store name with unexpected characters. ${EXAMPLE}` }
+		}
+		return { slug: seller }
 	}
-	return { slug }
+
+	return { problem: `is an eBay link but not a store link. ${EXAMPLE}` }
 }
 
 // Parse the whole uploaded file. Blank lines are skipped; every other line must

@@ -57,6 +57,37 @@ Deno.test('skips blank lines and keeps real line numbers in errors', () => {
 	)
 })
 
+Deno.test('accepts seller-search links, taking the seller from _ssn', () => {
+	const r = parseStoresFile(
+		[
+			'https://www.ebay.com/sch/i.html?_ssn=tlautopart&store_name=tlautopart&_oac=1&_trksid=p4429486.m3561.l161211',
+			// _ssn (the seller username) wins when it differs from store_name
+			'https://www.ebay.com/sch/i.html?_ssn=ainuosen&store_name=sevenblacksimiths&_oac=1&_trksid=p4429486.m3561.l161211',
+			'https://www.ebay.com/sch/i.html?_ssn=performance-autoparts&store_name=performanceautoparts&_oac=1',
+			'www.ebay.com/sch/i.html?_ssn=motorpartauxito&store_name=auxitobulb',
+		].join('\n'),
+	)
+	assertEquals(r.errors, [])
+	assertEquals(r.stores, [
+		'https://www.ebay.com/str/tlautopart',
+		'https://www.ebay.com/str/ainuosen',
+		'https://www.ebay.com/str/performance-autoparts',
+		'https://www.ebay.com/str/motorpartauxito',
+	])
+})
+
+Deno.test('accepts a search link with only store_name as the fallback', () => {
+	const r = parseStoresFile('https://www.ebay.com/sch/i.html?store_name=auxitobulb&_oac=1')
+	assertEquals(r.errors, [])
+	assertEquals(r.stores, ['https://www.ebay.com/str/auxitobulb'])
+})
+
+Deno.test('still rejects search links that name no seller at all', () => {
+	const r = parseStoresFile('https://www.ebay.com/sch/i.html?_nkw=brake+pads')
+	assertEquals(r.stores, [])
+	assertEquals(r.errors.length, 1)
+})
+
 Deno.test('rejects non-store eBay links with the line number', () => {
 	const r = parseStoresFile('https://www.ebay.com/itm/123456789')
 	assertEquals(r.stores, [])
