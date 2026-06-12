@@ -23,6 +23,7 @@ import {
 	parseResultCount,
 	parseSearchPage,
 	parseShipping,
+	parseStoreUsername,
 	type SearchCard,
 } from './parse.ts'
 import { convert, loadRates } from './fx.ts'
@@ -35,7 +36,10 @@ const DEFAULT_MAX_REQUESTS = 25000 // budget stop per run; see README.
 const SEGMENT_CAP = 9000 // eBay stops serving a search past ~10k results; a
 // price band that yields this many gets split in half and re-walked.
 const MAX_PAGES_PER_SEGMENT = 45
-const LISTING_WAVE = 5 // search pages fetched concurrently while walking one store
+const LISTING_WAVE = 10 // search pages fetched concurrently while walking one
+// store: ~30s/wave of 2,400 items. Still well under the ebay.com domain limit
+// (~1,170 RPM observed); the real cost of a bigger wave is a slightly longer
+// overshoot at each band's end.
 const PAGE_REFETCHES = 1 // refetches of a page that added nothing before counting it
 const END_OF_BAND_PAGES = 2 // consecutive nothing-new pages that end a band
 const ROWS_PER_CSV = 50000
@@ -193,6 +197,18 @@ async function walkBand(
 		page += pages.length
 	}
 	return { added, total }
+}
+
+// The real seller username behind a /str/ store page, for when the slug
+// search finds nothing. Returns null when the page does not name one;
+// a budget stop still propagates.
+async function resolveSellerUsername(storeURL: string): Promise<string | null> {
+	try {
+		return parseStoreUsername(await fetchHTML(storeURL))
+	} catch (err) {
+		if (err instanceof BudgetExceeded) throw err
+		return null
+	}
 }
 
 // List a seller's full catalog. A band that hits eBay's ~10k search ceiling,
@@ -401,6 +417,16 @@ async function listStores(db: DatabaseSync) {
 			}
 
 			let count = await listStoreProducts(store.store_name, capPerStore, save)
+			if (count === 0) {
+				// The /str/ slug is not always the seller's username, and only the
+				// seller search can band-split past eBay's ~10k ceiling. The store
+				// page names the real username; search again with that.
+				const username = await resolveSellerUsername(store.store_url)
+				if (username && username.toLowerCase() !== store.store_name.toLowerCase()) {
+					console.log(`  ${store.store_name} is run by seller ${username}, searching again`)
+					count = await listStoreProducts(username, capPerStore, save)
+				}
+			}
 			if (count === 0) count = await listStorePageProducts(store.store_url, capPerStore, save)
 
 			setStatus.run(count > 0 ? 'discovered' : 'empty', null, store.store_name)

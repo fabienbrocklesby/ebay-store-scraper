@@ -1,7 +1,14 @@
 // Unit tests for the pure HTML parsers, against compact synthetic fixtures
 // that mirror eBay's real markup anchors.
 import { assertEquals } from '@std/assert'
-import { htmlToText, parseItemPage, parseResultCount, parseSearchPage, parseShipping } from './parse.ts'
+import {
+	htmlToText,
+	parseItemPage,
+	parseResultCount,
+	parseSearchPage,
+	parseShipping,
+	parseStoreUsername,
+} from './parse.ts'
 
 function card(id: string, title: string, price = '18.20', img = 'zKQAAOSwFnFWFVhC') {
 	return `<li class="s-card s-card--horizontal" data-listingid=${id}>
@@ -60,6 +67,15 @@ Deno.test('parseResultCount reads exact and capped ("15,000+") counts', () => {
 	assertEquals(parseResultCount(heading('15,000+ results')), 15000)
 	assertEquals(parseResultCount(heading('0 results')), 0)
 	assertEquals(parseResultCount('<html><body>no heading</body></html>'), null)
+})
+
+Deno.test('parseStoreUsername reads the seller behind a store page', () => {
+	// Store slug and username differ: the page state JSON names the seller.
+	const html = `<script>x={"storeName":"guaranteedtofitparts","username":"guaranteedtofit"}</script>
+		<a href="https://www.ebay.com/sch/i.html?_ssn=guaranteedtofit&store_name=guaranteedtofitparts">See all</a>`
+	assertEquals(parseStoreUsername(html), 'guaranteedtofit')
+	assertEquals(parseStoreUsername('<a href="/sch/i.html?_oac=1&_ssn=somebody&x=1">items</a>'), 'somebody')
+	assertEquals(parseStoreUsername('<html><body>nothing here</body></html>'), null)
 })
 
 const ITEM_PAGE = `<html><head><title>Control Arm Kit for BMW | eBay</title></head><body>

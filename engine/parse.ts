@@ -106,6 +106,16 @@ export function parseResultCount(html: string): number | null {
 	return m ? Number(m[1].replaceAll(',', '')) : null
 }
 
+// The seller's username as embedded in their /str/ store page (page state
+// JSON, and the _ssn= parameter of the page's own search links). The /str/
+// slug is NOT always the username: e.g. the store "guaranteedtofitparts" is
+// run by the seller "guaranteedtofit", and the seller search needs the
+// latter.
+export function parseStoreUsername(html: string): string | null {
+	const m = html.match(/"username"\s*:\s*"([^"]+)"/) ?? html.match(/[?&]_ssn=([^&"'\s\\]+)/)
+	return m ? m[1] : null
+}
+
 // Shipping and delivery as eBay renders them for the viewer's country (the
 // page fetch is geolocated there). Empty fields mean eBay did not state them.
 //
