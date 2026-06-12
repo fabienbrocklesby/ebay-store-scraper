@@ -97,13 +97,14 @@ export function parseSearchPage(html: string): SearchCard[] {
 }
 
 // eBay's own result count from a search page ("153 results", "15,000+
-// results"; the figure caps at 15,000+ for big result sets). Returns null when
-// the page carries no count. CAUTION: eBay transiently serves a fully-formed
-// page claiming "0 results" for sellers with thousands of live listings, so a
-// count is only trustworthy on a page that also carries product cards.
-export function parseResultCount(html: string): number | null {
-	const m = html.match(/srp-controls__count-heading[^>]*>[\s\S]{0,80}?([\d,]+)\+?\s*results?/)
-	return m ? Number(m[1].replaceAll(',', '')) : null
+// results", "3,000,000 results"). `capped` is true when eBay shows a "+",
+// meaning the real figure is higher. Returns null when the page carries no
+// count. CAUTION: eBay transiently serves a fully-formed page claiming
+// "0 results" for sellers with thousands of live listings, so a count is
+// only trustworthy on a page that also carries product cards.
+export function parseResultCount(html: string): { count: number; capped: boolean } | null {
+	const m = html.match(/srp-controls__count-heading[^>]*>[\s\S]{0,80}?([\d,]+)(\+?)\s*results?/)
+	return m ? { count: Number(m[1].replaceAll(',', '')), capped: m[2] === '+' } : null
 }
 
 // The seller's username as embedded in their /str/ store page (page state

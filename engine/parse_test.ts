@@ -62,10 +62,11 @@ Deno.test('parseResultCount reads exact and capped ("15,000+") counts', () => {
 	const heading = (text: string) =>
 		`<div class="srp-controls__control srp-controls__count">
 			<h1 class=srp-controls__count-heading><!--F#f_0-->${text}<!--F/--></h1></div>`
-	assertEquals(parseResultCount(heading('153 results')), 153)
-	assertEquals(parseResultCount(heading('1 result')), 1)
-	assertEquals(parseResultCount(heading('15,000+ results')), 15000)
-	assertEquals(parseResultCount(heading('0 results')), 0)
+	assertEquals(parseResultCount(heading('153 results')), { count: 153, capped: false })
+	assertEquals(parseResultCount(heading('1 result')), { count: 1, capped: false })
+	assertEquals(parseResultCount(heading('15,000+ results')), { count: 15000, capped: true })
+	assertEquals(parseResultCount(heading('3,000,000 results')), { count: 3000000, capped: false })
+	assertEquals(parseResultCount(heading('0 results')), { count: 0, capped: false })
 	assertEquals(parseResultCount('<html><body>no heading</body></html>'), null)
 })
 

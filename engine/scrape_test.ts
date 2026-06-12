@@ -130,6 +130,26 @@ Deno.test('a band reporting more than the ceiling splits early instead of walkin
 	assertEquals(new Set(out.map((c) => c.item_id)).size, count)
 })
 
+Deno.test('parallel band workers cover the same catalog as a sequential walk', async () => {
+	// Same overflowing-store fixture as the ceiling test, walked with 4 band
+	// workers: the dynamic pool must drain split halves pushed mid-flight and
+	// dedupe across concurrently walked bands.
+	const fetchPage = (url: string) => {
+		const { page: p, lo, hi } = params(url)
+		if (lo === null && hi === null) {
+			if (p <= 40) return page(Array.from({ length: 240 }, (_, i) => card((p - 1) * 240 + i + 1)))
+			return page(Array.from({ length: 240 }, (_, i) => card(39 * 240 + i + 1)))
+		}
+		const key = (Number(lo ?? 0) * 7919 + Number(hi ?? 999983)) % 100000
+		if (p === 1) return page(Array.from({ length: 50 }, (_, i) => card(1000000 + key * 100 + i)))
+		return page([])
+	}
+	const out: SearchCard[] = []
+	const count = await listStoreProducts('x', Number.MAX_SAFE_INTEGER, (c) => out.push(c), fetchPage, 'x', 4)
+	assertEquals(count > 9600, true)
+	assertEquals(new Set(out.map((c) => c.item_id)).size, count)
+})
+
 Deno.test('a fetch error propagates (never silently treated as empty)', async () => {
 	let threw = ''
 	try {

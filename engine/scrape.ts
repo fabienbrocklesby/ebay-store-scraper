@@ -106,11 +106,12 @@ function searchPageURL(seller: string, page: number, lo?: number, hi?: number): 
 
 // --- listing walk ---
 
-export type SearchPage = { cards: SearchCard[]; total: number | null }
+export type SearchPage = { cards: SearchCard[]; total: number | null; totalCapped?: boolean }
 type FetchPage = (url: string) => Promise<SearchPage>
 const fetchSearchPage: FetchPage = async (url) => {
 	const html = await fetchHTML(url)
-	return { cards: parseSearchPage(html), total: parseResultCount(html) }
+	const count = parseResultCount(html)
+	return { cards: parseSearchPage(html), total: count?.count ?? null, totalCapped: count?.capped ?? false }
 }
 
 // Walk one price band of a seller's results, calling onCard for each NEW card.
@@ -145,9 +146,10 @@ async function walkBand(
 	onCard: (c: SearchCard) => void,
 	fetchPage: FetchPage,
 	stopWhenOverCap: boolean,
-): Promise<{ added: number; total: number | null }> {
+): Promise<{ added: number; total: number | null; totalCapped: boolean }> {
 	let added = 0
 	let total: number | null = null
+	let totalCapped = false
 	let zeroStreak = 0 // consecutive pages that added nothing, across waves
 	const collect = (cards: SearchCard[]) => {
 		let fresh = 0
@@ -171,14 +173,19 @@ async function walkBand(
 
 		let exhausted = false
 		for (let i = 0; i < pages.length; i++) {
-			let { cards, total: pageTotal } = pages[i]
+			let { cards, total: pageTotal, totalCapped: pageCapped } = pages[i]
 			let newOnPage = collect(cards)
 			for (let retry = 0; newOnPage === 0 && retry < PAGE_REFETCHES; retry++) {
 				if (verbose) console.log(`    page ${page + i} of ${seller} added nothing, refetching`)
-				;({ cards, total: pageTotal } = await fetchPage(searchPageURL(seller, page + i, lo, hi)))
+				;({ cards, total: pageTotal, totalCapped: pageCapped } = await fetchPage(
+					searchPageURL(seller, page + i, lo, hi),
+				))
 				newOnPage = collect(cards)
 			}
-			if (total === null && cards.length > 0) total = pageTotal
+			if (total === null && cards.length > 0 && pageTotal !== null) {
+				total = pageTotal
+				totalCapped = pageCapped ?? false
+			}
 
 			if (newOnPage === 0) {
 				zeroStreak++
@@ -196,7 +203,7 @@ async function walkBand(
 		if (stopWhenOverCap && total !== null && total > SEGMENT_CAP) break
 		page += pages.length
 	}
-	return { added, total }
+	return { added, total, totalCapped }
 }
 
 // The real seller username behind a /str/ store page, for when the slug
@@ -214,36 +221,66 @@ async function resolveSellerUsername(storeURL: string): Promise<string | null> {
 // List a seller's full catalog. A band that hits eBay's ~10k search ceiling,
 // by its own reported result count or by the number of cards actually served,
 // is split in half (price-wise) and both halves re-walked, until every band
-// fits. `fetchPage` is injectable for testing.
+// fits. Bands walk `bandWorkers` at a time: a megastore's discovery is
+// thousands of pages, and walking one band at a time would take hours. The
+// first page that names eBay's own result count triggers a "reports ...
+// listings" log line, so the UI can show the goal before discovery finishes.
+// `fetchPage` is injectable for testing.
 export async function listStoreProducts(
 	seller: string,
 	cap: number,
 	onCard: (c: SearchCard) => void,
 	fetchPage: FetchPage = fetchSearchPage,
+	label = seller,
+	bandWorkers = 1,
 ): Promise<number> {
 	const seen = new Set<string>()
-	const bands: Array<[number | undefined, number | undefined]> = [[undefined, undefined]]
+	const queue: Array<[number | undefined, number | undefined]> = [[undefined, undefined]]
+	let announced = false
 
-	while (bands.length > 0 && seen.size < cap) {
-		const [lo, hi] = bands.pop()!
+	const walkOne = async ([lo, hi]: [number | undefined, number | undefined]) => {
 		const floor = lo ?? 0
 		// A band narrower than one cent that still overflows is a single price
 		// point holding more than eBay will serve; accepted as-is. Megastores
 		// (millions of listings) really do pack 10k+ items into sub-dollar
 		// windows, so splitting continues below $1.
 		const splittable = hi === undefined || hi - floor > 0.01
-		const { added, total } = await walkBand(seller, lo, hi, cap, seen, onCard, fetchPage, splittable)
+		const { added, total, totalCapped } = await walkBand(seller, lo, hi, cap, seen, onCard, fetchPage, splittable)
+		if (!announced && lo === undefined && hi === undefined && total !== null) {
+			announced = true
+			console.log(
+				`  ${label} reports ${totalCapped ? 'more than' : 'about'} ${total.toLocaleString('en-US')} listings`,
+			)
+		}
 		const overflowed = added >= SEGMENT_CAP || (total !== null && total > SEGMENT_CAP)
-		if (!overflowed || !splittable) continue
+		if (!overflowed || !splittable) return
 
 		if (hi === undefined) {
 			const mid = floor > 0 ? floor * 2 : 100
-			bands.push([floor, mid], [mid, undefined])
+			queue.push([floor, mid], [mid, undefined])
 		} else {
 			const mid = (floor + hi) / 2
-			bands.push([floor, mid], [mid, hi])
+			queue.push([floor, mid], [mid, hi])
 		}
 	}
+
+	// Dynamic worker pool: finished bands push their split halves back onto
+	// the queue, so the pool drains only when no band is queued or in flight.
+	let active = 0
+	await new Promise<void>((resolve, reject) => {
+		const pump = () => {
+			while (active < Math.max(1, bandWorkers) && queue.length > 0 && seen.size < cap) {
+				const band = queue.pop()!
+				active++
+				walkOne(band).then(() => {
+					active--
+					pump()
+				}, reject)
+			}
+			if (active === 0) resolve()
+		}
+		pump()
+	})
 	return seen.size
 }
 
@@ -408,6 +445,11 @@ async function listStores(db: DatabaseSync) {
 		console.log(`  found ${found} products so far (${requestsMade()} requests)`)
 	}
 
+	// Aim for ~`concurrency` listing requests in flight overall: stores share
+	// the band workers, and a single-megastore job gets all of them.
+	const lanes = Math.max(1, Math.ceil(concurrency / LISTING_WAVE))
+	const bandWorkers = Math.max(1, Math.floor(lanes / Math.min(stores.length, lanes)))
+
 	let budgetHit = false
 	const listOne = async (store: any) => {
 		if (budgetHit) return
@@ -419,7 +461,14 @@ async function listStores(db: DatabaseSync) {
 				noteFound()
 			}
 
-			let count = await listStoreProducts(store.store_name, capPerStore, save)
+			let count = await listStoreProducts(
+				store.store_name,
+				capPerStore,
+				save,
+				fetchSearchPage,
+				store.store_name,
+				bandWorkers,
+			)
 			if (count === 0) {
 				// The /str/ slug is not always the seller's username, and only the
 				// seller search can band-split past eBay's ~10k ceiling. The store
@@ -427,7 +476,7 @@ async function listStores(db: DatabaseSync) {
 				const username = await resolveSellerUsername(store.store_url)
 				if (username && username.toLowerCase() !== store.store_name.toLowerCase()) {
 					console.log(`  ${store.store_name} is run by seller ${username}, searching again`)
-					count = await listStoreProducts(username, capPerStore, save)
+					count = await listStoreProducts(username, capPerStore, save, fetchSearchPage, store.store_name, bandWorkers)
 				}
 			}
 			if (count === 0) count = await listStorePageProducts(store.store_url, capPerStore, save)

@@ -29,6 +29,8 @@ export interface EngineProgress {
 	storesChecked: number // listed + empty + failed
 	storesFailed: number
 	checkingStores: string[] // started but not yet finished, in start order
+	reportedListings: number // sum of eBay's own per-store listing counts
+	reportedCapped: boolean // true when any count was a "more than" figure
 	productsFound: number // best live count from the listing phase
 	completedListed: number // sum of per-store "listed" completion lines
 	productsTotal: number // total of the current desc/details phase
@@ -48,6 +50,8 @@ export function newProgress(): EngineProgress {
 		storesChecked: 0,
 		storesFailed: 0,
 		checkingStores: [],
+		reportedListings: 0,
+		reportedCapped: false,
 		productsFound: 0,
 		completedListed: 0,
 		productsTotal: 0,
@@ -81,6 +85,11 @@ export function feedLine(p: EngineProgress, line: string): EngineProgress {
 	}
 	if ((m = line.match(/^checking (\S+)$/))) {
 		p.checkingStores.push(m[1])
+		return p
+	}
+	if ((m = line.match(/^\s+\S+ reports (about|more than) ([\d,]+) listings/))) {
+		p.reportedListings += Number(m[2].replaceAll(',', ''))
+		if (m[1] === 'more than') p.reportedCapped = true
 		return p
 	}
 	if ((m = line.match(/^\s+found (\d+) products so far \((\d+) requests\)/))) {
@@ -182,23 +191,37 @@ function runningStatus(p: EngineProgress, minutesElapsed?: number): FriendlyStat
 			return { headline: 'Starting up...', detail: '', percent: null, canResume: false }
 		case 'listing': {
 			const checked = p.storesTotal > 1 ? `${n(p.storesChecked)} of ${n(p.storesTotal)} stores checked` : ''
-			const found = p.productsFound > 0 ? `${n(p.productsFound)} products found so far` : ''
+			// eBay names each store's size early in the walk, so the goal is
+			// visible long before discovery finishes ("4,200 of about 2,614,702").
+			const goal = Math.max(p.reportedListings, p.productsFound)
+			const found = p.reportedListings > 0
+				? `${n(p.productsFound)} of ${p.reportedCapped ? 'more than' : 'about'} ${n(goal)} products found so far`
+				: p.productsFound > 0
+				? `${n(p.productsFound)} products found so far`
+				: ''
 			const names = p.checkingStores.slice(0, 3).join(', ') +
 				(p.checkingStores.length > 3 ? ` and ${n(p.checkingStores.length - 3)} more` : '')
 			const checking = names ? `now checking ${names}` : ''
-			// A rough step ETA once some stores have completed: store sizes vary
-			// wildly, so this firms up as more of them finish.
-			const eta = minutesElapsed && minutesElapsed > 0 && p.storesChecked > 0 && p.storesTotal > p.storesChecked
+			// Product-based ETA once eBay has told us the store size; otherwise a
+			// rough store-count ETA, which firms up as stores finish.
+			const eta = p.reportedListings > 0 && minutesElapsed && minutesElapsed > 0 && p.productsFound > 0
+				? timeLeft(goal - p.productsFound, p.productsFound / minutesElapsed).replace(' left', ' left in this step')
+				: minutesElapsed && minutesElapsed > 0 && p.storesChecked > 0 && p.storesTotal > p.storesChecked
 				? timeLeft(p.storesTotal - p.storesChecked, p.storesChecked / minutesElapsed)
 					.replace(' left', ' left in this step')
 				: ''
 			const headline = p.storesTotal === 1 && p.checkingStores.length === 1
 				? `Finding products in ${p.checkingStores[0]}...`
 				: `Finding products in ${n(p.storesTotal)} ${p.storesTotal === 1 ? 'store' : 'stores'}...`
+			const percent = p.storesTotal > 1
+				? Math.floor((p.storesChecked / p.storesTotal) * 100)
+				: p.reportedListings > 0 && goal > 0
+				? Math.min(99, Math.floor((p.productsFound / goal) * 100))
+				: null
 			return {
 				headline,
 				detail: [checked, found, p.storesTotal === 1 ? '' : checking, eta].filter(Boolean).join(', '),
-				percent: p.storesTotal > 1 ? Math.floor((p.storesChecked / p.storesTotal) * 100) : null,
+				percent,
 				canResume: false,
 			}
 		}

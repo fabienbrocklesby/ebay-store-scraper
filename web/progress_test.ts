@@ -20,6 +20,35 @@ Deno.test('parses the listing phase', () => {
 	assertEquals(p.requestsUsed, 37)
 })
 
+Deno.test('a reported store size shows the goal, an ETA and a percent while listing', () => {
+	const p = parseLog([
+		'listing 1 stores (concurrency 160)',
+		'checking guaranteedtofitparts',
+		'  guaranteedtofitparts is run by seller guaranteedtofit, searching again',
+		'  guaranteedtofitparts reports about 2,614,702 listings',
+		'  found 52000 products so far (240 requests)',
+	].join('\n'))
+	assertEquals(p.reportedListings, 2614702)
+	assertEquals(p.reportedCapped, false)
+	const s = friendlyStatus('running', p, 0, 10)
+	assertEquals(s.headline, 'Finding products in guaranteedtofitparts...')
+	assertEquals(s.detail.includes('52,000 of about 2,614,702 products found so far'), true)
+	assertEquals(s.detail.includes('left in this step'), true)
+	assertEquals(s.percent, Math.floor((52000 / 2614702) * 100))
+})
+
+Deno.test('a "more than" store size keeps the goal honest once found passes it', () => {
+	const p = parseLog([
+		'listing 1 stores (concurrency 160)',
+		'checking somestore',
+		'  somestore reports more than 15,000 listings',
+		'  found 148000 products so far (700 requests)',
+	].join('\n'))
+	assertEquals(p.reportedCapped, true)
+	const s = friendlyStatus('running', p, 0, 10)
+	assertEquals(s.detail.includes('148,000 of more than 148,000 products found so far'), true)
+})
+
 Deno.test('parses the details phase and its progress ticks', () => {
 	const p = parseLog(SAMPLE_RUN)
 	assertEquals(p.phase, 'details')
