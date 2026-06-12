@@ -12,6 +12,9 @@ const API_KEY = Deno.env.get('ZYTE_API_KEY') ?? ''
 const RATE_LIMIT_STATUSES = [429, 503]
 const TRANSIENT_STATUSES = [500, 520, 521, 522, 524]
 const DOMAIN_LIMIT_TYPES = ['/limits/over-domain-limit', '/limits/over-org-domain-limit']
+// Zyte-reported upstream hiccups (e.g. 421 /website/connection-error when a
+// single connection to eBay drops): retryable regardless of HTTP status.
+const TRANSIENT_ERROR_TYPES = ['/website/connection-error', '/website/temporary-error', '/temporary-error']
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms))
 
@@ -90,8 +93,10 @@ export async function fetchHTML(url: string, opts: FetchOptions = {}, attempt = 
 		}
 		return fetchHTML(url, opts, attempt + 1)
 	}
-	if (TRANSIENT_STATUSES.includes(res.status) && attempt <= 4) {
-		if (verbose) console.log(`    zyte ${res.status} transient, retry ${attempt} in ${attempt * 3}s ${url}`)
+	if ((TRANSIENT_STATUSES.includes(res.status) || TRANSIENT_ERROR_TYPES.includes(errorType)) && attempt <= 5) {
+		if (verbose) {
+			console.log(`    zyte ${res.status} ${errorType || 'transient'}, retry ${attempt} in ${attempt * 3}s ${url}`)
+		}
 		await sleep(attempt * 3000)
 		return fetchHTML(url, opts, attempt + 1)
 	}

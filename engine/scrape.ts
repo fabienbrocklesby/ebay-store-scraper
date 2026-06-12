@@ -227,8 +227,11 @@ export async function listStoreProducts(
 	while (bands.length > 0 && seen.size < cap) {
 		const [lo, hi] = bands.pop()!
 		const floor = lo ?? 0
-		// A band narrower than $1 that still overflows is accepted as-is.
-		const splittable = hi === undefined || hi - floor > 1
+		// A band narrower than one cent that still overflows is a single price
+		// point holding more than eBay will serve; accepted as-is. Megastores
+		// (millions of listings) really do pack 10k+ items into sub-dollar
+		// windows, so splitting continues below $1.
+		const splittable = hi === undefined || hi - floor > 0.01
 		const { added, total } = await walkBand(seller, lo, hi, cap, seen, onCard, fetchPage, splittable)
 		const overflowed = added >= SEGMENT_CAP || (total !== null && total > SEGMENT_CAP)
 		if (!overflowed || !splittable) continue
@@ -406,7 +409,7 @@ async function listStores(db: DatabaseSync) {
 	}
 
 	let budgetHit = false
-	await runPool(stores, concurrency, async (store) => {
+	const listOne = async (store: any) => {
 		if (budgetHit) return
 		console.log(`checking ${store.store_name}`)
 		try {
@@ -448,7 +451,19 @@ async function listStores(db: DatabaseSync) {
 			setStatus.run('failed', (err as Error).message, store.store_name)
 			console.error(`FAILED  ${store.store_name}: ${(err as Error).message} (will retry next run)`)
 		}
-	})
+	}
+	await runPool(stores, concurrency, listOne)
+
+	// One unlucky request must not cost a store its whole listing: stores that
+	// failed (an upstream error that outlived the transport retries) get fresh
+	// passes while the budget lasts. Already-saved products dedupe on re-walk.
+	const failedStores = db.prepare("SELECT store_name, store_url FROM stores WHERE status = 'failed'")
+	for (let pass = 1; pass <= 2 && !budgetHit; pass++) {
+		const failed = failedStores.all() as any[]
+		if (failed.length === 0) break
+		console.log(`retrying ${failed.length} failed stores (pass ${pass})`)
+		await runPool(failed, concurrency, listOne)
+	}
 }
 
 // Phase 2 (--desc): one cheap raw request per product for the description.
