@@ -16,7 +16,7 @@
 // deno-lint-ignore-file no-explicit-any
 
 import { DatabaseSync } from 'node:sqlite'
-import { BudgetExceeded, configure, fetchHTML, requestsMade } from './zyte.ts'
+import { BudgetExceeded, configure, fetchHTML, requestsMade, ZyteAccountError } from './zyte.ts'
 import {
 	htmlToText,
 	parseItemPage,
@@ -497,6 +497,11 @@ async function listStores(db: DatabaseSync) {
 				budgetHit = true
 				return
 			}
+			if (err instanceof ZyteAccountError) {
+				if (!budgetHit) console.log(`fatal stop: ${err.message}`)
+				budgetHit = true
+				return
+			}
 			setStatus.run('failed', (err as Error).message, store.store_name)
 			console.error(`FAILED  ${store.store_name}: ${(err as Error).message} (will retry next run)`)
 		}
@@ -536,6 +541,11 @@ async function fetchDescriptions(db: DatabaseSync) {
 				budgetHit = true
 				return // rows stay 'listed'; the next run picks them up
 			}
+			if (err instanceof ZyteAccountError) {
+				if (!budgetHit) console.log(`fatal stop: ${err.message}`)
+				budgetHit = true
+				return
+			}
 			if (verbose) console.log(`  desc FAIL ${row.item_id}: ${(err as Error).message}`)
 		}
 		tick()
@@ -562,6 +572,18 @@ async function fetchDetails(db: DatabaseSync) {
 	console.log(`fetching full details for ${rows.length} products (concurrency ${concurrency})`)
 	const tick = progress(rows.length, 25) // ~every 1.3s at full speed, keeps the web UI lively
 	let budgetHit = false
+	// Circuit breaker: when nearly everything is failing, something systemic is
+	// wrong (account problem, hard ban) and every further attempt is waste.
+	let okCount = 0
+	let failCount = 0
+	const tripBreaker = () => {
+		if (okCount + failCount !== 200 || failCount <= 160) return
+		console.log(
+			`fatal stop: ${failCount} of the first ${okCount + failCount} product fetches failed. ` +
+				`Stopping so requests are not wasted; check the Zyte account and try Resume later.`,
+		)
+		budgetHit = true
+	}
 	await runPool(rows, concurrency, async (row) => {
 		if (budgetHit) return
 		const now = new Date().toISOString()
@@ -590,6 +612,7 @@ async function fetchDetails(db: DatabaseSync) {
 				now,
 				row.item_id,
 			)
+			okCount++
 		} catch (err) {
 			if (err instanceof BudgetExceeded) {
 				if (!budgetHit) {
@@ -598,7 +621,14 @@ async function fetchDetails(db: DatabaseSync) {
 				budgetHit = true
 				return
 			}
+			if (err instanceof ZyteAccountError) {
+				if (!budgetHit) console.log(`fatal stop: ${err.message}`)
+				budgetHit = true
+				return
+			}
 			fail.run((err as Error).message, now, row.item_id)
+			failCount++
+			tripBreaker()
 		}
 		tick()
 	})

@@ -49,6 +49,20 @@ Deno.test('a "more than" store size keeps the goal honest once found passes it',
 	assertEquals(s.detail.includes('148,000 of more than 148,000 products found so far'), true)
 })
 
+Deno.test('a fatal stop reads as a resumable stop with its reason', () => {
+	const p = parseLog([
+		'listing 1 stores (concurrency 160)',
+		'fetching full details for 2018272 products (concurrency 160)',
+		'fatal stop: Zyte is rejecting all requests (/auth/account-suspended). Fix the account at app.zyte.com (billing or suspension), then resume.',
+	].join('\n'))
+	assertEquals(p.budgetStop, true)
+	assertEquals(p.fatalReason.includes('account-suspended'), true)
+	const s = friendlyStatus('stopped', p, 0)
+	assertEquals(s.headline, 'Stopped early to protect your spend.')
+	assertEquals(s.detail.includes('app.zyte.com'), true)
+	assertEquals(s.canResume, true)
+})
+
 Deno.test('parses the details phase and its progress ticks', () => {
 	const p = parseLog(SAMPLE_RUN)
 	assertEquals(p.phase, 'details')

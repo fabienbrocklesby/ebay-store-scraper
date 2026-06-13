@@ -38,6 +38,18 @@ export class BudgetExceeded extends Error {
 	}
 }
 
+// The account itself is rejecting requests (suspended, key revoked, payment
+// problem). Retrying is pure waste: a suspended account once absorbed 1.8M
+// pointless fetches overnight. Callers must stop the whole run.
+const FATAL_ACCOUNT_TYPES = ['/auth/account-suspended', '/auth/key-not-found']
+export class ZyteAccountError extends Error {
+	constructor(errorType: string) {
+		super(
+			`Zyte is rejecting all requests (${errorType}). Fix the account at app.zyte.com (billing or suspension), then resume.`,
+		)
+	}
+}
+
 export interface FetchOptions {
 	geolocation?: string // ISO country code; eBay then renders shipping for it
 }
@@ -79,6 +91,8 @@ export async function fetchHTML(url: string, opts: FetchOptions = {}, attempt = 
 	try {
 		errorType = JSON.parse(body).type ?? ''
 	} catch { /* non-JSON error body */ }
+
+	if (FATAL_ACCOUNT_TYPES.includes(errorType)) throw new ZyteAccountError(errorType)
 
 	const rateLimited = RATE_LIMIT_STATUSES.includes(res.status) || DOMAIN_LIMIT_TYPES.includes(errorType)
 	if (rateLimited && attempt <= 8) {

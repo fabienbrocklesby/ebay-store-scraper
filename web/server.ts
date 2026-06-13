@@ -8,7 +8,8 @@
 //   APP_PASSWORD          required. The shared password for the whole app.
 //   PORT                  default 8000
 //   DATA_DIR              default ./jobs (one folder per job; mount a volume here)
-//   MAX_REQUESTS_PER_JOB  default 1000000 (the per-job spending safety limit)
+//   MAX_REQUESTS_PER_JOB  default 200000 (the per-run spending safety limit;
+//                         a run pauses there and Resume continues it)
 //   SCRAPE_CONCURRENCY    default 160 (validated sweet spot, ~1.6M products/day)
 //   ZYTE_API_KEY          inherited by job subprocesses; zyte.ts has a fallback
 
@@ -44,10 +45,13 @@ if ((Deno.env.get('ZYTE_API_KEY') ?? '').trim() === '') {
 
 const PORT = Number(Deno.env.get('PORT') ?? '8000')
 const DATA_DIR = Deno.env.get('DATA_DIR') ?? './jobs'
-// Optional default per-run spending stop for new jobs; unset or blank means no
-// limit (each job can still set its own under Technical details).
+// Default per-RUN spending stop for new jobs. After one runaway overnight job,
+// no limit is no longer an option: unset means 200k requests per run (about
+// $25 at the base rate, more with a ship-to country). A run that hits it
+// pauses resumable, nothing is lost, and each job can still raise its own
+// limit under Technical details.
 const maxRequestsRaw = Number(Deno.env.get('MAX_REQUESTS_PER_JOB') ?? '')
-const MAX_REQUESTS_PER_JOB = Number.isFinite(maxRequestsRaw) && maxRequestsRaw > 0 ? maxRequestsRaw : null
+const MAX_REQUESTS_PER_JOB = Number.isFinite(maxRequestsRaw) && maxRequestsRaw > 0 ? maxRequestsRaw : 200_000
 const SCRAPE_CONCURRENCY = Number(Deno.env.get('SCRAPE_CONCURRENCY') ?? '160')
 // Measured blended $ per 1,000 Zyte requests; converts user-facing dollar
 // limits into the engine's --max-requests. Re-measure in the Zyte dashboard

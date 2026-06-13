@@ -294,10 +294,13 @@ export function statusFragment(v: StatusView): string {
 	// shipping cost, delivery time, and the output currency all follow it.
 	let startBlock = ''
 	if (job.status === 'draft') {
-		const selected = job.shipTo ?? 'NZ'
-		const options = SHIP_OPTIONS.map((o) =>
-			`<option value="${o.code}"${o.code === selected ? ' selected' : ''}>${e(o.label)}</option>`
-		).join('') + '<option value="">No country (prices as listed)</option>'
+		// No country is the default: fetching pages "as seen from" a country
+		// routes through premium proxies and can cost 25-50x more per product.
+		const selected = job.shipTo ?? ''
+		const options = `<option value=""${selected === '' ? ' selected' : ''}>No country (standard rate)</option>` +
+			SHIP_OPTIONS.map((o) =>
+				`<option value="${o.code}"${o.code === selected ? ' selected' : ''}>${e(o.label)} (premium rate)</option>`
+			).join('')
 		startBlock = `<div class="mt-5 rounded-lg bg-stone-50 p-4">
 			<form method="post" action="/jobs/${e(job.id)}/start" class="flex flex-wrap items-end gap-3">
 				<label class="block text-sm text-stone-600">Ship to
@@ -308,8 +311,10 @@ export function statusFragment(v: StatusView): string {
 				<button class="rounded-lg bg-stone-900 px-5 py-2 font-medium text-white hover:bg-stone-700">Start</button>
 			</form>
 			<p class="mt-2 text-xs text-stone-500">
-				Every product gets the shipping cost and delivery time to this country (when the seller
-				offers it), and all prices are converted to its currency.
+				Picking a country adds the shipping cost and delivery time to every product and converts
+				prices to its currency, but those pages are fetched through premium proxies and can cost
+				<strong>25-50x more per product</strong>. Leave it on "No country" unless you need
+				delivery prices, and check your Zyte dashboard rate on a small job first.
 			</p>
 		</div>`
 	}

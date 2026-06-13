@@ -38,6 +38,7 @@ export interface EngineProgress {
 	ratePerMin: number // products per minute, from the engine's progress line
 	requestsUsed: number
 	budgetStop: boolean
+	fatalReason: string // set when the engine stopped itself (account problem, mass failures)
 	exportedProducts: number | null // set once the final CSV export ran
 	failedProducts: number // from the end-of-run summary
 }
@@ -59,6 +60,7 @@ export function newProgress(): EngineProgress {
 		ratePerMin: 0,
 		requestsUsed: 0,
 		budgetStop: false,
+		fatalReason: '',
 		exportedProducts: null,
 		failedProducts: 0,
 	}
@@ -132,6 +134,13 @@ export function feedLine(p: EngineProgress, line: string): EngineProgress {
 	}
 	if (line.startsWith('budget stop')) {
 		p.budgetStop = true
+		return p
+	}
+	if ((m = line.match(/^fatal stop: (.*)$/))) {
+		// The engine stopped itself to protect spend; the job lands in the same
+		// resumable "stopped" state as a budget stop.
+		p.budgetStop = true
+		p.fatalReason = m[1]
 		return p
 	}
 	if ((m = line.match(/^Zyte requests this run: (\d+)/))) {
@@ -299,12 +308,19 @@ export function friendlyStatus(
 				canResume: true,
 			}
 		case 'stopped':
-			return {
-				headline: 'Stopped at the spending safety limit.',
-				detail: `Everything collected so far is saved and ready to download. ${RESUME_NOTE}`,
-				percent: null,
-				canResume: true,
-			}
+			return p.fatalReason
+				? {
+					headline: 'Stopped early to protect your spend.',
+					detail: `${p.fatalReason} Everything collected so far is saved and ready to download.`,
+					percent: null,
+					canResume: true,
+				}
+				: {
+					headline: 'Stopped at the spending safety limit.',
+					detail: `Everything collected so far is saved and ready to download. ${RESUME_NOTE}`,
+					percent: null,
+					canResume: true,
+				}
 		case 'failed':
 			return {
 				headline: 'Something went wrong and this job stopped early.',
